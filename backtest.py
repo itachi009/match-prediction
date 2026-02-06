@@ -63,6 +63,9 @@ MIN_TRAIN_MATCHES_WF = 300
 MIN_TEST_MATCHES_WF = 120
 BOOTSTRAP_SAMPLES = 3000
 WF_TUNED_TRAIN_ADV_THRESHOLD = 0.25
+MAX_TUNING_EVALS = 5000
+TUNING_RANDOM_SEED = 42
+TUNING_REFINEMENT_TOPK = 80
 TUNING_GRID = {
     "min_edge": [0.05, 0.055, 0.06, 0.065],
     "min_ev": [0.04, 0.05, 0.06],
@@ -769,12 +772,19 @@ def config_conservativeness_score(cfg):
 def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_label="Tuning", print_progress=False):
     score_formula = "roi - 0.50*max_drawdown_pct + 0.05*min(profit_factor,2.0) - penalty_low_bets - gate_penalty"
     keys = list(TUNING_GRID.keys())
-    combos = list(itertools.product(*[TUNING_GRID[k] for k in keys]))
+    full_combos = list(itertools.product(*[TUNING_GRID[k] for k in keys]))
+    sampled_mode = len(full_combos) > MAX_TUNING_EVALS
+    if sampled_mode:
+        rng = np.random.default_rng(TUNING_RANDOM_SEED)
+        sampled_idx = rng.choice(len(full_combos), size=MAX_TUNING_EVALS, replace=False)
+        combos = [full_combos[int(i)] for i in sampled_idx]
+    else:
+        combos = list(full_combos)
 
     rows = []
     candidates = []
 
-    for i, values in enumerate(combos, start=1):
+    def evaluate_combo(values):
         cfg = dict(baseline_config)
         for k, v in zip(keys, values):
             cfg[k] = float(v)
@@ -811,11 +821,55 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
             "residual_shrink_odds_2_5": cfg["residual_shrink_odds_2_5"],
             "residual_shrink_odds_3_0": cfg["residual_shrink_odds_3_0"],
         }
+        cand = {
+            "cfg": cfg,
+            "res": res,
+            "score": float(score),
+            "cons": float(cons),
+            "feasible_gate": bool(feasible_gate),
+            "values": tuple(float(v) for v in values),
+        }
+        return row, cand
+
+    for i, values in enumerate(combos, start=1):
+        row, cand = evaluate_combo(values)
         rows.append(row)
-        candidates.append({"cfg": cfg, "res": res, "score": float(score), "cons": float(cons), "feasible_gate": bool(feasible_gate)})
+        candidates.append(cand)
 
         if print_progress and i % 40 == 0:
             print(f"    {progress_label}: {i}/{len(combos)}")
+
+    refinement_evals = 0
+    if sampled_mode and candidates and TUNING_REFINEMENT_TOPK > 0:
+        top = sorted(candidates, key=lambda x: (x["score"], x["cons"]), reverse=True)[: int(TUNING_REFINEMENT_TOPK)]
+        key_to_vals = {k: [float(v) for v in TUNING_GRID[k]] for k in keys}
+        key_to_idx = {k: {float(v): i for i, v in enumerate(vals)} for k, vals in key_to_vals.items()}
+        seen = set(c["values"] for c in candidates)
+        refine_values = []
+        for c in top:
+            base_vals = list(c["values"])
+            for j, k in enumerate(keys):
+                vals = key_to_vals[k]
+                idx_map = key_to_idx[k]
+                cur_idx = idx_map[float(base_vals[j])]
+                for n_idx in [cur_idx - 1, cur_idx, cur_idx + 1]:
+                    if n_idx < 0 or n_idx >= len(vals):
+                        continue
+                    nv = list(base_vals)
+                    nv[j] = float(vals[n_idx])
+                    t = tuple(nv)
+                    if t in seen:
+                        continue
+                    seen.add(t)
+                    refine_values.append(t)
+
+        for i, values in enumerate(refine_values, start=1):
+            row, cand = evaluate_combo(values)
+            rows.append(row)
+            candidates.append(cand)
+            refinement_evals += 1
+            if print_progress and i % 80 == 0:
+                print(f"    {progress_label} refinement: {i}/{len(refine_values)}")
 
     if not candidates:
         best_cfg = dict(baseline_config)
@@ -827,7 +881,11 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
         df_tuning = pd.DataFrame(rows)
         diagnostics = {
             "score_formula": score_formula,
-            "num_configs_total": int(len(combos)),
+            "num_configs_total": int(len(full_combos)),
+            "sampled_mode": bool(sampled_mode),
+            "num_configs_evaluated_stage1": int(len(combos)),
+            "num_configs_evaluated_refinement": int(refinement_evals),
+            "num_configs_evaluated_total": int(len(rows)),
             "num_configs_dd_le_5": 0,
             "num_configs_feasible": 0,
             "selected_from_feasible_pool": False,
@@ -844,7 +902,11 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
     df_tuning = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
     diagnostics = {
         "score_formula": score_formula,
-        "num_configs_total": int(len(combos)),
+        "num_configs_total": int(len(full_combos)),
+        "sampled_mode": bool(sampled_mode),
+        "num_configs_evaluated_stage1": int(len(combos)),
+        "num_configs_evaluated_refinement": int(refinement_evals),
+        "num_configs_evaluated_total": int(len(rows)),
         "num_configs_dd_le_5": int(sum(1 for c in candidates if c["res"]["max_drawdown_pct"] <= 5.0)),
         "num_configs_feasible": int(len(feasible_pool)),
         "selected_from_feasible_pool": bool(len(feasible_pool) > 0),
