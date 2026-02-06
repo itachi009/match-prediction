@@ -68,7 +68,7 @@ def build_inverse_rows(df):
     # Invert differential features.
     diff_like_cols = []
     for c in inv.columns:
-        if c.endswith("_diff"):
+        if c.endswith("_diff") or "_diff_" in c:
             diff_like_cols.append(c)
     for explicit in ["rank_diff", "log_rank_diff", "h2h_diff"]:
         if explicit in inv.columns and explicit not in diff_like_cols:
@@ -124,6 +124,26 @@ def train_model():
 
     print(f"Dataset originale: train={len(train_df)} | test={len(test_df)}")
     print(f"Feature usate ({len(feature_cols)}): {feature_cols}")
+
+    v12_tokens = [
+        "days_since_last",
+        "inactive_bucket",
+        "matches_last_30d",
+        "long_stop_90d",
+        "no_prev_match",
+        "upset_win_rate_12",
+        "bad_loss_rate_12",
+        "confidence_rank_score_12",
+        "confidence_n_valid_12",
+        "is_level_",
+        "_diff_cf",
+    ]
+    v12_features = [c for c in feature_cols if any(t in c for t in v12_tokens)]
+    print(f"[CHECK] V12 feature rilevate: {len(v12_features)}")
+    if v12_features:
+        print(f"[CHECK] Esempio V12: {v12_features[:20]}")
+    else:
+        print("[CHECK] ATTENZIONE: nessuna feature V12 rilevata.")
 
     # Data doubling simmetrico solo sul train
     train_aug = augment_symmetric(train_df)
@@ -229,6 +249,8 @@ def train_model():
             "brier": float(brier),
             "logloss": float(ll),
         },
+        "v12_feature_count": int(len(v12_features)),
+        "v12_feature_sample": v12_features[:30],
         "top15_features": feat_imp.head(15).to_dict(orient="records"),
     }
     with open(OUTPUT_META_FILE, "w", encoding="utf-8") as f:
