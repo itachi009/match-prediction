@@ -63,9 +63,9 @@ MIN_TRAIN_MATCHES_WF = 300
 MIN_TEST_MATCHES_WF = 120
 BOOTSTRAP_SAMPLES = 3000
 WF_TUNED_TRAIN_ADV_THRESHOLD = 0.25
-MAX_TUNING_EVALS = 5000
+MAX_TUNING_EVALS = 2000
 TUNING_RANDOM_SEED = 42
-TUNING_REFINEMENT_TOPK = 80
+TUNING_REFINEMENT_TOPK = 30
 TUNING_GRID = {
     "min_edge": [0.05, 0.055, 0.06, 0.065],
     "min_ev": [0.04, 0.05, 0.06],
@@ -87,6 +87,15 @@ STRESS_SCENARIOS = [
     {"name": "medium", "payout_haircut_pct": 0.02, "commission_pct": 0.003, "slippage_pct": 0.003},
     {"name": "hard", "payout_haircut_pct": 0.03, "commission_pct": 0.005, "slippage_pct": 0.005},
 ]
+
+
+def render_progress_bar(current, total, width=30):
+    total = max(1, int(total))
+    current = max(0, min(int(current), total))
+    ratio = current / total
+    done = int(round(width * ratio))
+    bar = "#" * done + "-" * (width - done)
+    return f"[{bar}] {ratio * 100:6.2f}% ({current}/{total})"
 
 
 def freeze_baseline_config(config, path=BASELINE_CONFIG_FILE):
@@ -831,13 +840,14 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
         }
         return row, cand
 
+    stage1_step = max(1, len(combos) // 40)
     for i, values in enumerate(combos, start=1):
         row, cand = evaluate_combo(values)
         rows.append(row)
         candidates.append(cand)
 
-        if print_progress and i % 40 == 0:
-            print(f"    {progress_label}: {i}/{len(combos)}")
+        if print_progress and (i % stage1_step == 0 or i == len(combos)):
+            print(f"    {progress_label} stage1 {render_progress_bar(i, len(combos))}")
 
     refinement_evals = 0
     if sampled_mode and candidates and TUNING_REFINEMENT_TOPK > 0:
@@ -863,13 +873,14 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
                     seen.add(t)
                     refine_values.append(t)
 
+        refine_step = max(1, len(refine_values) // 40)
         for i, values in enumerate(refine_values, start=1):
             row, cand = evaluate_combo(values)
             rows.append(row)
             candidates.append(cand)
             refinement_evals += 1
-            if print_progress and i % 80 == 0:
-                print(f"    {progress_label} refinement: {i}/{len(refine_values)}")
+            if print_progress and (i % refine_step == 0 or i == len(refine_values)):
+                print(f"    {progress_label} refine {render_progress_bar(i, len(refine_values))}")
 
     if not candidates:
         best_cfg = dict(baseline_config)
@@ -1115,7 +1126,9 @@ def run_walk_forward_validation(df_sim, baseline_config):
     n_valid_folds = 0
     rows = []
 
+    total_folds = len(quarters) - 1
     for i in range(1, len(quarters)):
+        print(f"    WF progress {render_progress_bar(i, total_folds)}")
         train_quarters = quarters[:i]
         test_quarter = quarters[i]
 
@@ -1163,7 +1176,7 @@ def run_walk_forward_validation(df_sim, baseline_config):
             baseline_config,
             calibrator=fold_calibrator,
             progress_label=f"WF {test_quarter}",
-            print_progress=False,
+            print_progress=True,
         )
         base_train = simulate_strategy(
             df_train,
