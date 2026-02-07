@@ -1,0 +1,11 @@
+pandas
+numpy
+scikit-learn
+xgboost
+joblib
+matplotlib
+tqdm
+unidecode
+thefuzz[speedup]
+requests
+openpyxl
