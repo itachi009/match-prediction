@@ -172,7 +172,6 @@ def build_default_params(model_family, seed):
             "tree_method": "hist",
             "n_jobs": -1,
             "random_state": seed,
-            "early_stopping_rounds": 100,
         }
     if model_family == "lgbm":
         return {
@@ -234,6 +233,7 @@ def fit_base_model(model_family, model, X_train, y_train):
         if len(X_val) >= 200 and len(np.unique(y_val)) > 1:
             try:
                 if model_family == "xgb":
+                    model.set_params(early_stopping_rounds=100)
                     model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
                 elif model_family == "lgbm":
                     callbacks = [lgb.early_stopping(100, verbose=False)] if lgb is not None else None
