@@ -480,6 +480,11 @@ def process_matches(df):
     feat_df = pd.DataFrame(features_list)
     feat_df.to_csv("processed_features.csv", index=False)
     print("Saved processed_features.csv")
+    try:
+        feat_df.to_parquet("processed_features.parquet", index=False)
+        print("Saved processed_features.parquet")
+    except Exception as e:
+        print(f"[WARN] Could not save processed_features.parquet: {e}")
 
     # Snapshot latest stats for app
     print("Snapshotting latest stats V12...")

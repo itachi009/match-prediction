@@ -1,6 +1,7 @@
 import pandas as pd
 import glob
 import os
+import numpy as np
 
 # Config
 START_YEAR = 2015
@@ -191,36 +192,58 @@ def restructure_data(df, players_df):
 def clean_data(df):
     print("Cleaning data...")
     
-    # Robust Date Parsing (Sackmann YYYYMMDD vs European DD/MM/YYYY)
+    # Robust Date Parsing with explicit formats to avoid ambiguous inference.
     dates = df['tourney_date'].astype(str)
     
-    # 1. Try Sackmann Format
+    # 1) Sackmann format: YYYYMMDD
     d1 = pd.to_datetime(dates, format='%Y%m%d', errors='coerce')
     
-    # 2. Try European/Standard Format
-    d2 = pd.to_datetime(dates, dayfirst=True, errors='coerce')
+    # 2) European format: DD/MM/YYYY
+    d2 = pd.to_datetime(dates, format='%d/%m/%Y', errors='coerce')
+
+    # 3) ISO format: YYYY-MM-DD
+    d3 = pd.to_datetime(dates, format='%Y-%m-%d', errors='coerce')
     
-    # Combine (prefer d1, fill with d2)
-    df['tourney_date'] = d1.fillna(d2)
+    # Combine with deterministic precedence.
+    parsed_dates = d1.fillna(d2).fillna(d3)
+    df['tourney_date'] = parsed_dates
+
+    # Data quality report before dropping rows.
+    parse_failed = int(parsed_dates.isna().sum())
+    parse_failed_pct = (parse_failed / max(1, len(df))) * 100.0
+    print(f"[QUALITY] Date parse failed: {parse_failed}/{len(df)} ({parse_failed_pct:.2f}%)")
+
+    critical_cols = ['p1_name', 'p2_name', 'tourney_date', 'match_level', 'target']
+    for c in critical_cols:
+        if c in df.columns:
+            null_pct = df[c].isna().mean() * 100.0
+            print(f"[QUALITY] NaN {c}: {null_pct:.2f}%")
+
+    if 'match_id' in df.columns:
+        dup_count = int(df['match_id'].duplicated().sum())
+        dup_pct = (dup_count / max(1, len(df))) * 100.0
+        print(f"[QUALITY] duplicate match_id: {dup_count}/{len(df)} ({dup_pct:.2f}%)")
+    else:
+        key_cols = ['tourney_id', 'match_num', 'p1_name', 'p2_name']
+        if all(c in df.columns for c in key_cols):
+            dup_count = int(df.duplicated(subset=key_cols).sum())
+            dup_pct = (dup_count / max(1, len(df))) * 100.0
+            print(f"[QUALITY] duplicate synthetic key ({'+'.join(key_cols)}): {dup_count}/{len(df)} ({dup_pct:.2f}%)")
     
     # Drop NaNs
     df = df.dropna(subset=['p1_name', 'p2_name', 'tourney_date'])
     df = df.sort_values(by=['tourney_date', 'tourney_id', 'match_num']).reset_index(drop=True)
     
-    # Impute minutes if missing (Step 1 requirement)
-    # df['minutes']
-    # If minutes NaN, sets_played * 40
-    # We need sets_played. We calculated sets in is_decider but didn't save it. 
-    # Let's do a quick apply.
-    def estimate_minutes(row):
-        if pd.notna(row['minutes']): return row['minutes']
-        
-        score = str(row['score'])
-        if pd.isna(score): return 90 # Default
-        sets = [s for s in score.split() if s and s[0].isdigit()]
-        return len(sets) * 40
-        
-    df['minutes'] = df.apply(estimate_minutes, axis=1)
+    # Vectorized minute imputation:
+    # if missing, use sets_played * 40, fallback default 90 for retired/unknown scores.
+    if 'minutes' not in df.columns:
+        df['minutes'] = np.nan
+    score_str = df.get('score', pd.Series('', index=df.index)).astype(str)
+    is_retired = score_str.str.contains(r"RET|W/O", case=False, regex=True, na=False)
+    set_count = score_str.str.findall(r"\d+-\d+").str.len().fillna(0).astype(float)
+    est_minutes = set_count.clip(lower=1) * 40.0
+    est_minutes[(set_count <= 0) | is_retired] = 90.0
+    df['minutes'] = pd.to_numeric(df['minutes'], errors='coerce').fillna(est_minutes)
     
     return df
 

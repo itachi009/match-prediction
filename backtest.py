@@ -22,8 +22,9 @@ except ImportError:
 FEATURES_FILE = "processed_features.csv"
 METADATA_FILE = "clean_matches.csv"
 ODDS_FILE_LOCAL = "2024_test.csv"
-MODEL_FILE = "model_v9_balanced.pkl"
-MODEL_FEATURES_FILE = "model_features.pkl"
+ACTIVE_MODEL_FILE = "active_model.json"
+MODEL_FILE_DEFAULT = "model_v9_balanced.pkl"
+MODEL_FEATURES_FILE_DEFAULT = "model_features.pkl"
 PLOT_FILE = "real_backtest.png"
 BASELINE_CONFIG_FILE = "backtest_baseline_config.json"
 VALIDATION_REPORT_FILE = "backtest_validation_report.json"
@@ -31,6 +32,33 @@ WALKFORWARD_REPORT_FILE = "backtest_walkforward_report.json"
 STRESS_REPORT_FILE = "backtest_stress_report.json"
 RELIABILITY_PLOT_FILE = "reliability_curve.png"
 RELIABILITY_TABLE_FILE = "reliability_table.csv"
+
+
+def resolve_active_model_registry(path=ACTIVE_MODEL_FILE):
+    default_payload = {
+        "run_id": "default_backtest_fallback",
+        "model_family": "xgb",
+        "model_path": MODEL_FILE_DEFAULT,
+        "features_path": MODEL_FEATURES_FILE_DEFAULT,
+        "metadata_path": None,
+    }
+    if not os.path.exists(path):
+        print(f"[WARN] {path} non trovato. Uso fallback legacy.")
+        return default_payload
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        merged = dict(default_payload)
+        merged.update(payload or {})
+        return merged
+    except Exception as e:
+        print(f"[WARN] Impossibile leggere {path}: {e}. Uso fallback legacy.")
+        return default_payload
+
+
+ACTIVE_MODEL = resolve_active_model_registry()
+MODEL_FILE = ACTIVE_MODEL.get("model_path", MODEL_FILE_DEFAULT)
+MODEL_FEATURES_FILE = ACTIVE_MODEL.get("features_path", MODEL_FEATURES_FILE_DEFAULT)
 
 
 # --- STRATEGY BASELINE (POINT 1: FROZEN BASELINE) ---
@@ -64,22 +92,24 @@ BASELINE_CONFIG = {
 
 # --- TEMPORAL VALIDATION (POINT 3) ---
 H1_H2_SPLIT_DATE = "2024-07-01"
-MIN_BETS_FOR_TUNING = 15
+MIN_BETS_FOR_TUNING = 25
 MIN_TRAIN_MATCHES_WF = 300
 MIN_TEST_MATCHES_WF = 120
 BOOTSTRAP_SAMPLES = 3000
 WF_TUNED_TRAIN_ADV_THRESHOLD = 0.25
+MIN_VALID_FOLDS_FOR_WF_GATE = 3
+MIN_NOT_WORSE_FOLDS = 2
 MAX_TUNING_EVALS = 2000
 TUNING_RANDOM_SEED = 42
 TUNING_REFINEMENT_TOPK = 30
 TUNING_GRID = {
-    "min_edge": [0.05, 0.055, 0.06, 0.065],
-    "min_ev": [0.04, 0.05, 0.06],
-    "min_confidence": [0.60, 0.62, 0.64],
-    "prob_shrink": [0.58, 0.62, 0.66],
+    "min_edge": [0.055, 0.06, 0.065],
+    "min_ev": [0.05, 0.06],
+    "min_confidence": [0.62, 0.64, 0.66],
+    "prob_shrink": [0.60, 0.62, 0.64],
     "kelly_fraction": [0.01, 0.015, 0.02],
     "max_stake_pct": [0.01, 0.015, 0.02],
-    "max_bet_share": [0.08, 0.10, 0.12],
+    "max_bet_share": [0.08, 0.10],
     "min_kelly_f": [0.05, 0.07, 0.10],
     "min_signal_score": [0.003, 0.004, 0.005],
     "edge_slope_by_odds": [0.015, 0.02, 0.03],
@@ -108,6 +138,9 @@ def freeze_baseline_config(config, path=BASELINE_CONFIG_FILE):
     payload = {
         "frozen_at": pd.Timestamp.utcnow().isoformat(),
         "model_file": MODEL_FILE,
+        "model_features_file": MODEL_FEATURES_FILE,
+        "active_model_file": ACTIVE_MODEL_FILE,
+        "active_model": ACTIVE_MODEL,
         "features_file": FEATURES_FILE,
         "odds_file": ODDS_FILE_LOCAL,
         "config": config,
@@ -1106,11 +1139,11 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
         res = simulate_strategy(df_train, cfg, initial_bankroll=1000.0, compute_bootstrap=False, calibrator=calibrator)
         pf = float(res["profit_factor"]) if np.isfinite(res["profit_factor"]) else 2.0
         pf = min(pf, 2.0)
-        penalty_low_bets = max(0, MIN_BETS_FOR_TUNING - int(res["bets"])) * 0.10
+        penalty_low_bets = max(0, MIN_BETS_FOR_TUNING - int(res["bets"])) * 0.15
         gate_penalty = 5.0 if float(res["max_drawdown_pct"]) > 5.0 else 0.0
         score = float(res["roi"]) - 0.50 * float(res["max_drawdown_pct"]) + 0.05 * pf - penalty_low_bets - gate_penalty
         cons = config_conservativeness_score(cfg)
-        feasible_gate = float(res["max_drawdown_pct"]) <= 5.0 and int(res["bets"]) >= 20
+        feasible_gate = float(res["max_drawdown_pct"]) <= 5.0 and int(res["bets"]) >= MIN_BETS_FOR_TUNING
 
         row = {
             "score": float(score),
@@ -1191,7 +1224,7 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
         best_cfg = dict(baseline_config)
         best_res = simulate_strategy(df_train, best_cfg, initial_bankroll=1000.0, compute_bootstrap=False, calibrator=calibrator)
         pf = float(best_res["profit_factor"]) if np.isfinite(best_res["profit_factor"]) else 2.0
-        penalty_low_bets = max(0, MIN_BETS_FOR_TUNING - int(best_res["bets"])) * 0.10
+        penalty_low_bets = max(0, MIN_BETS_FOR_TUNING - int(best_res["bets"])) * 0.15
         gate_penalty = 5.0 if float(best_res["max_drawdown_pct"]) > 5.0 else 0.0
         best_score = float(best_res["roi"] - 0.50 * best_res["max_drawdown_pct"] + 0.05 * min(pf, 2.0) - penalty_low_bets - gate_penalty)
         df_tuning = pd.DataFrame(rows)
@@ -1459,11 +1492,15 @@ def run_walk_forward_validation(df_sim, baseline_config):
                     "test_matches": test_matches,
                     "fold_valid": False,
                     "skip_reason": skip_reason,
-                    "train_best_score": np.nan,
-                    "train_best_roi": np.nan,
-                    "baseline_test_roi": np.nan,
-                    "tuned_test_roi": np.nan,
-                    "baseline_test_bets": 0,
+                "train_best_score": np.nan,
+                "train_best_roi": np.nan,
+                "train_baseline_roi": np.nan,
+                "train_tuned_adv_roi": np.nan,
+                "use_tuned_policy": np.nan,
+                "tuned_not_worse": np.nan,
+                "baseline_test_roi": np.nan,
+                "tuned_test_roi": np.nan,
+                "baseline_test_bets": 0,
                     "tuned_test_bets": 0,
                     "baseline_bankroll_end": baseline_bank,
                     "tuned_bankroll_end": tuned_bank,
@@ -1521,6 +1558,7 @@ def run_walk_forward_validation(df_sim, baseline_config):
                 "train_baseline_roi": base_train["roi"],
                 "train_tuned_adv_roi": tuned_train_adv,
                 "use_tuned_policy": bool(use_tuned_policy),
+                "tuned_not_worse": bool(float(tuned_test["roi"]) >= float(base_test["roi"])),
                 "baseline_test_roi": base_test["roi"],
                 "tuned_test_roi": tuned_test["roi"],
                 "baseline_test_bets": base_test["bets"],
@@ -1546,14 +1584,37 @@ def run_walk_forward_validation(df_sim, baseline_config):
     print(wf_df.to_string(index=False))
     overall_baseline_roi = (baseline_bank - 1000.0) / 1000.0 * 100.0 if n_valid_folds > 0 else np.nan
     overall_tuned_roi = (tuned_bank - 1000.0) / 1000.0 * 100.0 if n_valid_folds > 0 else np.nan
+    overall_tuned_vs_baseline_roi_diff = (
+        float(overall_tuned_roi - overall_baseline_roi)
+        if np.isfinite(overall_tuned_roi) and np.isfinite(overall_baseline_roi)
+        else np.nan
+    )
+    valid_df = wf_df[wf_df["fold_valid"] == True].copy()
+    tuned_not_worse_count = int(valid_df["tuned_not_worse"].fillna(False).astype(bool).sum()) if not valid_df.empty else 0
+    tuned_not_worse_min_required = int(min(MIN_NOT_WORSE_FOLDS, n_valid_folds))
+    tuned_not_worse_check = bool(
+        n_valid_folds >= MIN_VALID_FOLDS_FOR_WF_GATE and tuned_not_worse_count >= tuned_not_worse_min_required
+    )
     print(f"    Valid folds: {n_valid_folds}")
     print(f"    Walk-forward chained ROI baseline (valid folds): {overall_baseline_roi:.2f}%")
     print(f"    Walk-forward chained ROI tuned (valid folds): {overall_tuned_roi:.2f}%")
+    print(f"    Tuned vs baseline ROI diff (valid folds): {overall_tuned_vs_baseline_roi_diff:.2f}%")
+    print(
+        f"    Tuned not worse folds: {tuned_not_worse_count}/{n_valid_folds} "
+        f"(required>={tuned_not_worse_min_required}, gate_ready={tuned_not_worse_check})"
+    )
 
     wf_report = {
         "overall_baseline_roi": float(overall_baseline_roi),
         "overall_tuned_roi": float(overall_tuned_roi),
+        "overall_tuned_vs_baseline_roi_diff": float(overall_tuned_vs_baseline_roi_diff)
+        if np.isfinite(overall_tuned_vs_baseline_roi_diff)
+        else np.nan,
         "n_valid_folds": int(n_valid_folds),
+        "min_valid_folds_required_for_gate": int(MIN_VALID_FOLDS_FOR_WF_GATE),
+        "tuned_not_worse_count": int(tuned_not_worse_count),
+        "tuned_not_worse_min_required": int(tuned_not_worse_min_required),
+        "tuned_not_worse_check": bool(tuned_not_worse_check),
         "chained_roi_valid_folds": {
             "baseline": float(overall_baseline_roi),
             "tuned": float(overall_tuned_roi),
@@ -1683,18 +1744,23 @@ def evaluate_oos_gate(consolidated):
 
     wf_baseline = walk.get("overall_baseline_roi")
     wf_tuned = walk.get("overall_tuned_roi")
+    n_valid_folds = walk.get("n_valid_folds")
+    tuned_not_worse_check = walk.get("tuned_not_worse_check")
     mdd = baseline_result.get("max_drawdown_pct")
     ece_raw = calib.get("ece_raw")
     ece_cal = calib.get("ece_calibrated")
 
     c1 = wf_baseline is not None and np.isfinite(wf_baseline) and wf_baseline > 0
+    c_folds = n_valid_folds is not None and int(n_valid_folds) >= MIN_VALID_FOLDS_FOR_WF_GATE
     c2 = (
-        wf_baseline is not None
+        c_folds
+        and wf_baseline is not None
         and wf_tuned is not None
         and np.isfinite(wf_baseline)
         and np.isfinite(wf_tuned)
-        and (wf_tuned >= wf_baseline - 0.25)
+        and (wf_tuned >= wf_baseline - 0.10)
     )
+    c2b = bool(c_folds and bool(tuned_not_worse_check))
     c3 = mdd is not None and np.isfinite(mdd) and mdd <= 5.0
     ece_eps = 1e-6
     c4 = (
@@ -1707,18 +1773,22 @@ def evaluate_oos_gate(consolidated):
 
     if not c1:
         reasons.append("walkforward_baseline_roi<=0")
+    if not c_folds:
+        reasons.append("walkforward_not_enough_valid_folds")
     if not c2:
         reasons.append("walkforward_tuned_underperform_baseline_threshold")
+    if not c2b:
+        reasons.append("walkforward_tuned_not_worse_fold_count_failed")
     if not c3:
         reasons.append("max_drawdown_over_5pct")
     if not c4:
         reasons.append("ece_calibrated_worse_than_raw_tolerance")
 
-    passed = c1 and c2 and c3 and c4
-    n_ok = sum([c1, c2, c3, c4])
+    passed = c1 and c_folds and c2 and c2b and c3 and c4
+    n_ok = sum([c1, c_folds, c2, c2b, c3, c4])
     if passed:
         status = "GO"
-    elif n_ok >= 3:
+    elif n_ok >= 5:
         status = "GO_WITH_CAUTION"
     else:
         status = "NO_GO"
@@ -1728,7 +1798,9 @@ def evaluate_oos_gate(consolidated):
         "pass": bool(passed),
         "checks": {
             "walkforward_baseline_roi_gt_0": bool(c1),
+            "walkforward_min_valid_folds": bool(c_folds),
             "walkforward_tuned_vs_baseline_threshold": bool(c2),
+            "walkforward_tuned_not_worse_fold_count": bool(c2b),
             "max_drawdown_le_5pct": bool(c3),
             "ece_calibrated_lt_ece_raw": bool(c4),
         },
@@ -1736,10 +1808,60 @@ def evaluate_oos_gate(consolidated):
     }
 
 
+def build_promotion_decision(consolidated):
+    oos_gate = consolidated.get("oos_gate") or {}
+    walk = consolidated.get("walk_forward") or {}
+    baseline_result = consolidated.get("baseline_result") or {}
+    no_odds = consolidated.get("no_odds_eval") or {}
+    no_odds_gate = no_odds.get("gate") or {}
+
+    wf_baseline = walk.get("overall_baseline_roi")
+    wf_tuned = walk.get("overall_tuned_roi")
+    mdd = baseline_result.get("max_drawdown_pct")
+    no_odds_status = no_odds_gate.get("status")
+
+    c1 = bool(oos_gate.get("pass", False))
+    c2 = (
+        wf_baseline is not None
+        and wf_tuned is not None
+        and np.isfinite(wf_baseline)
+        and np.isfinite(wf_tuned)
+        and float(wf_tuned) >= float(wf_baseline) - 0.10
+    )
+    c3 = mdd is not None and np.isfinite(mdd) and float(mdd) <= 5.0
+    c4 = no_odds_status in {"pass", "insufficient_data"}
+
+    reasons = []
+    if not c1:
+        reasons.append("oos_gate_not_passed")
+    if not c2:
+        reasons.append("walkforward_tuned_below_baseline_minus_0_10")
+    if not c3:
+        reasons.append("max_drawdown_over_5pct")
+    if not c4:
+        reasons.append("no_odds_eval_gate_not_pass_or_insufficient_data")
+
+    status = "promote" if (c1 and c2 and c3 and c4) else "keep_baseline"
+    return {
+        "status": status,
+        "reasons": reasons,
+        "criteria_snapshot": {
+            "oos_gate_pass": bool(c1),
+            "walk_forward_overall_baseline_roi": float(wf_baseline) if wf_baseline is not None and np.isfinite(wf_baseline) else None,
+            "walk_forward_overall_tuned_roi": float(wf_tuned) if wf_tuned is not None and np.isfinite(wf_tuned) else None,
+            "max_drawdown_pct": float(mdd) if mdd is not None and np.isfinite(mdd) else None,
+            "no_odds_eval_gate_status": no_odds_status,
+        },
+    }
+
+
 def run_backtest_v7():
     print("============================================================")
     print("BACKTEST V10 - ORIENTED VALUE ENGINE")
     print("============================================================")
+    print(f"[MODEL] Active run_id: {ACTIVE_MODEL.get('run_id')}")
+    print(f"[MODEL] model_path: {MODEL_FILE}")
+    print(f"[MODEL] features_path: {MODEL_FEATURES_FILE}")
 
     # 1. INITIALIZE NORMALIZER
     print("[1] Inizializzazione Normalizzatore (Training Set)...")
@@ -1866,6 +1988,7 @@ def run_backtest_v7():
     # Consolidated report
     consolidated = {
         "baseline_config": BASELINE_CONFIG,
+        "active_model": ACTIVE_MODEL,
         "merge_stats": merge_stats,
         "baseline_result": {
             "bankroll": baseline_result["bankroll"],
@@ -1910,6 +2033,8 @@ def run_backtest_v7():
         consolidated["no_odds_eval"] = no_odds_report
     oos_gate = evaluate_oos_gate(consolidated)
     consolidated["oos_gate"] = oos_gate
+    promotion_decision = build_promotion_decision(consolidated)
+    consolidated["promotion_decision"] = promotion_decision
     with open(VALIDATION_REPORT_FILE, "w", encoding="utf-8") as f:
         json.dump(consolidated, f, indent=2)
     print(f"\nReport consolidato salvato in: {VALIDATION_REPORT_FILE}")
@@ -1917,6 +2042,10 @@ def run_backtest_v7():
     print(f"    Status: {oos_gate['status']} | Pass: {oos_gate['pass']}")
     if oos_gate["reasons"]:
         print(f"    Reasons: {', '.join(oos_gate['reasons'])}")
+    print("\n[11] Promotion Decision")
+    print(f"    Status: {promotion_decision['status']}")
+    if promotion_decision["reasons"]:
+        print(f"    Reasons: {', '.join(promotion_decision['reasons'])}")
 
 
 if __name__ == "__main__":

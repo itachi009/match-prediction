@@ -4,11 +4,34 @@ import numpy as np
 import joblib
 import sys
 import os
+import json
+
+ACTIVE_MODEL_FILE = "active_model.json"
+MODEL_PATH_DEFAULT = "model.pkl"
+FEATURES_PATH_DEFAULT = "model_features.pkl"
+
+
+def resolve_active_model():
+    payload = {
+        "model_path": MODEL_PATH_DEFAULT,
+        "features_path": FEATURES_PATH_DEFAULT,
+    }
+    if not os.path.exists(ACTIVE_MODEL_FILE):
+        return payload
+    try:
+        with open(ACTIVE_MODEL_FILE, "r", encoding="utf-8") as f:
+            current = json.load(f)
+        payload["model_path"] = current.get("model_path", MODEL_PATH_DEFAULT)
+        payload["features_path"] = current.get("features_path", FEATURES_PATH_DEFAULT)
+    except Exception:
+        pass
+    return payload
 
 def load_artifacts():
     try:
-        model = joblib.load("model.pkl")
-        features = joblib.load("model_features.pkl")
+        active = resolve_active_model()
+        model = joblib.load(active["model_path"])
+        features = joblib.load(active["features_path"])
         stats = pd.read_csv("latest_stats.csv")
         return model, features, stats
     except FileNotFoundError as e:

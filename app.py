@@ -3,21 +3,46 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
+import json
 import plotly.graph_objects as go
 
 # Page Config
 st.set_page_config(page_title="Tennis Match Predictor", page_icon="🎾", layout="wide")
 
 # Paths
-MODEL_PATH = "model.pkl"
-FEAT_PATH = "model_features.pkl"
+ACTIVE_MODEL_FILE = "active_model.json"
+MODEL_PATH_DEFAULT = "model.pkl"
+FEAT_PATH_DEFAULT = "model_features.pkl"
 STATS_PATH = "latest_stats.csv"
 ENCODER_PATH = "level_encoder.pkl"
 MATCHES_PATH = "clean_matches.csv"
 
+
+def resolve_active_model():
+    payload = {
+        "model_path": MODEL_PATH_DEFAULT,
+        "features_path": FEAT_PATH_DEFAULT,
+    }
+    if not os.path.exists(ACTIVE_MODEL_FILE):
+        return payload
+    try:
+        with open(ACTIVE_MODEL_FILE, "r", encoding="utf-8") as f:
+            current = json.load(f)
+        payload["model_path"] = current.get("model_path", MODEL_PATH_DEFAULT)
+        payload["features_path"] = current.get("features_path", FEAT_PATH_DEFAULT)
+    except Exception:
+        pass
+    return payload
+
+
+ACTIVE_MODEL = resolve_active_model()
+MODEL_PATH = ACTIVE_MODEL["model_path"]
+FEAT_PATH = ACTIVE_MODEL["features_path"]
+
 @st.cache_resource
 def load_artifacts():
     if not os.path.exists(MODEL_PATH): return None, None, None, None, None
+    if not os.path.exists(FEAT_PATH): return None, None, None, None, None
     
     model = joblib.load(MODEL_PATH)
     features = joblib.load(FEAT_PATH)
