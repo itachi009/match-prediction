@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 
 try:
     from utils import DataNormalizer, standardize_dates
@@ -53,6 +54,11 @@ BASELINE_CONFIG = {
     "slippage_pct": 0.00,
     "residual_shrink_odds_2_5": 0.96,
     "residual_shrink_odds_3_0": 0.95,
+    "no_odds_eval_enabled": True,
+    "no_odds_eval_year": 2024,
+    "no_odds_eval_levels": ["C", "F"],
+    "no_odds_gate_policy": "light",
+    "no_odds_min_matches": 200,
 }
 
 
@@ -393,6 +399,287 @@ def compute_ece_mce(prob, y, bins=10):
         weights.append(n / n_total)
 
     return float(ece), float(mce), np.array(centers), np.array(obs), np.array(weights)
+
+
+def safe_float_or_none(value):
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(v):
+        return None
+    return v
+
+
+def infer_match_levels(df):
+    if "level" in df.columns:
+        level_raw = df["level"]
+    elif "match_level" in df.columns:
+        level_raw = df["match_level"]
+    else:
+        level_raw = pd.Series([None] * len(df), index=df.index, dtype="object")
+
+    def norm_level(val):
+        if pd.isna(val):
+            return None
+        s = str(val).strip().upper()
+        if not s:
+            return None
+        if s in {"A", "C", "F"}:
+            return s
+        if s.startswith("ATP"):
+            return "A"
+        if "CHALL" in s:
+            return "C"
+        if "FUT" in s:
+            return "F"
+        first = s[0]
+        return first if first in {"A", "C", "F"} else None
+
+    levels = level_raw.apply(norm_level).astype("object")
+
+    if "is_level_c" in df.columns:
+        is_c = pd.to_numeric(df["is_level_c"], errors="coerce").fillna(0) > 0.5
+        levels.loc[levels.isna() & is_c] = "C"
+    if "is_level_f" in df.columns:
+        is_f = pd.to_numeric(df["is_level_f"], errors="coerce").fillna(0) > 0.5
+        levels.loc[levels.isna() & is_f] = "F"
+    if "is_level_a" in df.columns:
+        is_a = pd.to_numeric(df["is_level_a"], errors="coerce").fillna(0) > 0.5
+        levels.loc[levels.isna() & is_a] = "A"
+
+    return levels
+
+
+def infer_match_years(df):
+    date_col = None
+    for c in ["tourney_date", "date"]:
+        if c in df.columns:
+            date_col = c
+            break
+    if date_col is None:
+        return pd.Series(np.nan, index=df.index, dtype="float64")
+
+    raw = df[date_col]
+    years = pd.to_datetime(raw, errors="coerce").dt.year.astype("float64")
+
+    numeric = pd.to_numeric(raw, errors="coerce")
+    numeric_year = np.floor(numeric / 10000.0)
+    fallback = years.isna() & numeric_year.between(1900, 2100)
+    years.loc[fallback] = numeric_year.loc[fallback]
+    return years
+
+
+def extract_binary_target(df):
+    if "target" in df.columns:
+        y = pd.to_numeric(df["target"], errors="coerce")
+    elif "p1_is_real_winner" in df.columns:
+        y = pd.to_numeric(df["p1_is_real_winner"], errors="coerce")
+    else:
+        return pd.Series(np.nan, index=df.index, dtype="float64")
+    y = y.where(y.isin([0, 1]))
+    return y.astype("float64")
+
+
+def compute_prob_metrics(y_true, prob, bins=10):
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(prob, dtype=float)
+    valid = np.isfinite(y) & np.isfinite(p)
+    y = y[valid]
+    p = np.clip(p[valid], 1e-9, 1.0 - 1e-9)
+    n = int(len(y))
+    if n == 0:
+        return {
+            "n_matches": 0,
+            "logloss": None,
+            "brier": None,
+            "auc": None,
+            "accuracy_0_5": None,
+            "ece_10_bins": None,
+            "mce_10_bins": None,
+        }
+
+    y_int = y.astype(int)
+    logloss = -np.mean(y_int * np.log(p) + (1 - y_int) * np.log(1.0 - p))
+    brier = np.mean((p - y_int) ** 2)
+    acc = np.mean((p >= 0.5).astype(int) == y_int)
+    ece, mce, _, _, _ = compute_ece_mce(p, y_int, bins=bins)
+
+    auc = None
+    if len(np.unique(y_int)) >= 2:
+        try:
+            auc = float(roc_auc_score(y_int, p))
+        except Exception:
+            auc = None
+
+    return {
+        "n_matches": n,
+        "logloss": safe_float_or_none(logloss),
+        "brier": safe_float_or_none(brier),
+        "auc": safe_float_or_none(auc),
+        "accuracy_0_5": safe_float_or_none(acc),
+        "ece_10_bins": safe_float_or_none(ece),
+        "mce_10_bins": safe_float_or_none(mce),
+    }
+
+
+def compute_no_odds_train_prior(eval_year, allowed_levels):
+    try:
+        header = pd.read_csv(FEATURES_FILE, nrows=0)
+    except Exception:
+        return 0.5, 0
+
+    keep = [
+        c
+        for c in [
+            "target",
+            "p1_is_real_winner",
+            "date",
+            "tourney_date",
+            "level",
+            "match_level",
+            "is_level_a",
+            "is_level_c",
+            "is_level_f",
+        ]
+        if c in header.columns
+    ]
+    if not keep:
+        return 0.5, 0
+
+    hist = pd.read_csv(FEATURES_FILE, usecols=keep, low_memory=False)
+    years = infer_match_years(hist)
+    levels = infer_match_levels(hist)
+    y = extract_binary_target(hist)
+
+    mask = years.lt(float(eval_year)) & levels.isin(allowed_levels) & y.notna()
+    n_rows = int(mask.sum())
+    if n_rows <= 0:
+        return 0.5, 0
+
+    prior = float(np.clip(y.loc[mask].mean(), 1e-6, 1.0 - 1e-6))
+    if not np.isfinite(prior):
+        return 0.5, 0
+    return prior, n_rows
+
+
+def build_no_odds_eval_report(df_feats, baseline_config):
+    eval_year = int(baseline_config.get("no_odds_eval_year", 2024))
+    min_matches = int(baseline_config.get("no_odds_min_matches", 200))
+    gate_policy = str(baseline_config.get("no_odds_gate_policy", "light"))
+    cfg_levels = baseline_config.get("no_odds_eval_levels", ["C", "F"])
+    levels = [str(x).strip().upper() for x in cfg_levels if str(x).strip()]
+    levels = list(dict.fromkeys(levels)) if levels else ["C", "F"]
+
+    df = df_feats.copy()
+    if "tourney_date" not in df.columns and "date" in df.columns:
+        df["tourney_date"] = pd.to_datetime(df["date"], errors="coerce")
+    elif "tourney_date" in df.columns:
+        df["tourney_date"] = pd.to_datetime(df["tourney_date"], errors="coerce")
+    else:
+        df["tourney_date"] = pd.NaT
+
+    years = infer_match_years(df)
+    match_levels = infer_match_levels(df)
+    y = extract_binary_target(df)
+    raw_prob = pd.to_numeric(df.get("prob_p1_win"), errors="coerce")
+
+    mask = years.eq(float(eval_year)) & match_levels.isin(levels) & y.notna() & raw_prob.notna()
+    subset = pd.DataFrame(
+        {
+            "tourney_date": df["tourney_date"],
+            "level": match_levels,
+            "y": y,
+            "prob_raw": raw_prob,
+        }
+    ).loc[mask].copy()
+
+    split_date = pd.Timestamp(H1_H2_SPLIT_DATE)
+    calibrator_input = subset[subset["tourney_date"] < split_date][["tourney_date", "prob_raw", "y"]].copy()
+    calibrator_input = calibrator_input.rename(columns={"prob_raw": "prob_p1_win", "y": "p1_is_real_winner"})
+    calibrator = fit_probability_calibrator(calibrator_input)
+
+    if len(subset) > 0:
+        subset["prob_final"] = subset["prob_raw"].apply(
+            lambda p: apply_probability_pipeline(p, 2.0, baseline_config, calibrator=calibrator)[2]
+        )
+    else:
+        subset["prob_final"] = np.nan
+
+    combined = compute_prob_metrics(subset["y"], subset["prob_final"], bins=10)
+    by_level = {}
+    for lvl in levels:
+        lv = subset[subset["level"] == lvl]
+        by_level[lvl] = compute_prob_metrics(lv["y"], lv["prob_final"], bins=10)
+
+    prior_prob, prior_n_rows = compute_no_odds_train_prior(eval_year, levels)
+    baseline_p50 = compute_prob_metrics(subset["y"], np.full(len(subset), 0.5, dtype=float), bins=10)
+    baseline_prior = compute_prob_metrics(
+        subset["y"],
+        np.full(len(subset), prior_prob, dtype=float),
+        bins=10,
+    )
+
+    warnings = []
+    if combined["auc"] is not None and combined["auc"] < 0.50:
+        warnings.append(f"auc_below_0_50:{combined['auc']:.4f}")
+    if combined["ece_10_bins"] is not None and combined["ece_10_bins"] > 0.10:
+        warnings.append(f"ece_above_0_10:{combined['ece_10_bins']:.4f}")
+
+    reasons = []
+    if combined["n_matches"] < min_matches:
+        status = "insufficient_data"
+        reasons.append(f"n_matches_below_min:{combined['n_matches']}<{min_matches}")
+    else:
+        improves_logloss = (
+            combined["logloss"] is not None
+            and baseline_prior["logloss"] is not None
+            and combined["logloss"] < baseline_prior["logloss"]
+        )
+        improves_brier = (
+            combined["brier"] is not None
+            and baseline_prior["brier"] is not None
+            and combined["brier"] < baseline_prior["brier"]
+        )
+        if improves_logloss and improves_brier:
+            status = "pass"
+            reasons.append("model_beats_train_prior_on_logloss_and_brier")
+        else:
+            status = "fail"
+            if not improves_logloss:
+                reasons.append("logloss_not_better_than_train_prior")
+            if not improves_brier:
+                reasons.append("brier_not_better_than_train_prior")
+
+    return {
+        "enabled": True,
+        "source": FEATURES_FILE,
+        "year": eval_year,
+        "levels": levels,
+        "combined": combined,
+        "by_level": by_level,
+        "baselines": {
+            "p50": {
+                "probability": 0.5,
+                "combined": baseline_p50,
+            },
+            "train_prior": {
+                "probability": safe_float_or_none(prior_prob),
+                "n_train_rows": prior_n_rows,
+                "combined": baseline_prior,
+            },
+        },
+        "gate": {
+            "policy": gate_policy,
+            "status": status,
+            "reasons": reasons,
+        },
+        "warnings": warnings,
+        "calibrator_name": calibrator.get("name", "identity"),
+        "odds_proxy_for_pipeline": 2.0,
+    }
 
 
 def fit_probability_calibrator(df_side, min_train=200, min_val=120):
@@ -1472,6 +1759,27 @@ def run_backtest_v7():
     except Exception as e:
         print(f"    [ERROR] Errore features/modello: {e}")
         return
+    no_odds_report = None
+    if bool(BASELINE_CONFIG.get("no_odds_eval_enabled", False)):
+        print("\n[2b] Valutazione Model-Only C/F (senza quote)...")
+        try:
+            no_odds_report = build_no_odds_eval_report(df_feats, BASELINE_CONFIG)
+            gate = no_odds_report.get("gate", {})
+            print(
+                f"    C/F combined matches: {no_odds_report.get('combined', {}).get('n_matches', 0)} | "
+                f"Gate: {gate.get('status', 'n/a')}"
+            )
+            if no_odds_report.get("warnings"):
+                print(f"    Warnings: {', '.join(no_odds_report['warnings'])}")
+        except Exception as e:
+            print(f"    [WARN] no_odds_eval non disponibile: {e}")
+            no_odds_report = {
+                "enabled": True,
+                "source": FEATURES_FILE,
+                "year": int(BASELINE_CONFIG.get('no_odds_eval_year', 2024)),
+                "levels": BASELINE_CONFIG.get("no_odds_eval_levels", ["C", "F"]),
+                "error": str(e),
+            }
 
     # 3. LOAD ODDS
     print("\n[3] Caricamento e Normalizzazione Quote (Tennis-Data)...")
@@ -1598,6 +1906,8 @@ def run_backtest_v7():
         "stress_tests": stress_report,
         "walk_forward": walkforward_report,
     }
+    if no_odds_report is not None:
+        consolidated["no_odds_eval"] = no_odds_report
     oos_gate = evaluate_oos_gate(consolidated)
     consolidated["oos_gate"] = oos_gate
     with open(VALIDATION_REPORT_FILE, "w", encoding="utf-8") as f:
