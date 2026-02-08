@@ -32,6 +32,111 @@ WALKFORWARD_REPORT_FILE = "backtest_walkforward_report.json"
 STRESS_REPORT_FILE = "backtest_stress_report.json"
 RELIABILITY_PLOT_FILE = "reliability_curve.png"
 RELIABILITY_TABLE_FILE = "reliability_table.csv"
+BACKTEST_TUNING_CONFIG_FILE = "configs/backtest_tuning.json"
+
+
+DEFAULT_TUNING_RUNTIME = {
+    "min_bets_for_tuning": 100,
+    "objective_mode": "roi_minus_lambda_bets_ratio",
+    "lambda_bets": 0.5,
+    "max_bets_increase_pct": 0.20,
+    "fallback_eps_roi_pct": 0.10,
+    "restricted_tuning_mode": False,
+    "restricted_fixed_min_ev": 0.06,
+    "restricted_fixed_prob_shrink": 0.60,
+    "restricted_min_edge_values": [0.06, 0.065],
+    "restricted_min_confidence_values": [0.64, 0.66],
+    "fold_freq": "quarter",
+}
+
+
+def _as_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _as_int(value, default):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _as_float(value, default):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _as_float_list(value, default_list):
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            try:
+                out.append(float(item))
+            except Exception:
+                continue
+        return out if out else [float(v) for v in default_list]
+    return [float(v) for v in default_list]
+
+
+def load_backtest_tuning_runtime(path=BACKTEST_TUNING_CONFIG_FILE):
+    runtime = dict(DEFAULT_TUNING_RUNTIME)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f) or {}
+            if isinstance(payload, dict):
+                for k in runtime:
+                    if k in payload:
+                        runtime[k] = payload[k]
+        except Exception as e:
+            print(f"[WARN] Impossibile leggere tuning config {path}: {e}. Uso default.")
+
+    env_overrides = {
+        "BT_MIN_BETS_FOR_TUNING": ("min_bets_for_tuning", _as_int),
+        "BT_OBJECTIVE_MODE": ("objective_mode", str),
+        "BT_LAMBDA_BETS": ("lambda_bets", _as_float),
+        "BT_MAX_BETS_INCREASE_PCT": ("max_bets_increase_pct", _as_float),
+        "BT_FALLBACK_EPS_ROI_PCT": ("fallback_eps_roi_pct", _as_float),
+        "BT_RESTRICTED_TUNING_MODE": ("restricted_tuning_mode", _as_bool),
+        "BT_FOLD_FREQ": ("fold_freq", str),
+    }
+    for env_key, (cfg_key, caster) in env_overrides.items():
+        raw = os.getenv(env_key)
+        if raw is None:
+            continue
+        if caster in {_as_int, _as_float, _as_bool}:
+            runtime[cfg_key] = caster(raw, runtime[cfg_key])
+        else:
+            runtime[cfg_key] = caster(raw)
+
+    runtime["min_bets_for_tuning"] = _as_int(runtime.get("min_bets_for_tuning"), 100)
+    runtime["lambda_bets"] = _as_float(runtime.get("lambda_bets"), 0.5)
+    runtime["max_bets_increase_pct"] = _as_float(runtime.get("max_bets_increase_pct"), 0.20)
+    runtime["fallback_eps_roi_pct"] = _as_float(runtime.get("fallback_eps_roi_pct"), 0.10)
+    runtime["restricted_tuning_mode"] = _as_bool(runtime.get("restricted_tuning_mode"), False)
+    runtime["restricted_fixed_min_ev"] = _as_float(runtime.get("restricted_fixed_min_ev"), 0.06)
+    runtime["restricted_fixed_prob_shrink"] = _as_float(runtime.get("restricted_fixed_prob_shrink"), 0.60)
+    runtime["restricted_min_edge_values"] = _as_float_list(runtime.get("restricted_min_edge_values"), [0.06, 0.065])
+    runtime["restricted_min_confidence_values"] = _as_float_list(
+        runtime.get("restricted_min_confidence_values"), [0.64, 0.66]
+    )
+
+    objective_mode = str(runtime.get("objective_mode", "roi_minus_lambda_bets_ratio")).strip().lower()
+    valid_objectives = {"roi_minus_lambda_bets_ratio", "roi_minus_lambda_bets"}
+    runtime["objective_mode"] = objective_mode if objective_mode in valid_objectives else "roi_minus_lambda_bets_ratio"
+
+    fold_freq = str(runtime.get("fold_freq", "quarter")).strip().lower()
+    runtime["fold_freq"] = fold_freq if fold_freq in {"quarter", "halfyear"} else "quarter"
+    return runtime
 
 
 def resolve_active_model_registry(path=ACTIVE_MODEL_FILE):
@@ -92,7 +197,6 @@ BASELINE_CONFIG = {
 
 # --- TEMPORAL VALIDATION (POINT 3) ---
 H1_H2_SPLIT_DATE = "2024-07-01"
-MIN_BETS_FOR_TUNING = 25
 MIN_TRAIN_MATCHES_WF = 300
 MIN_TEST_MATCHES_WF = 120
 BOOTSTRAP_SAMPLES = 3000
@@ -102,6 +206,7 @@ MIN_NOT_WORSE_FOLDS = 2
 MAX_TUNING_EVALS = 2000
 TUNING_RANDOM_SEED = 42
 TUNING_REFINEMENT_TOPK = 30
+# Full legacy grid (kept for backward compatibility and optional full mode).
 TUNING_GRID = {
     "min_edge": [0.055, 0.06, 0.065],
     "min_ev": [0.05, 0.06],
@@ -116,6 +221,19 @@ TUNING_GRID = {
     "residual_shrink_odds_2_5": [0.96, 0.98],
     "residual_shrink_odds_3_0": [0.92, 0.95, 0.96],
 }
+
+BACKTEST_TUNING_RUNTIME = load_backtest_tuning_runtime()
+MIN_BETS_FOR_TUNING = int(BACKTEST_TUNING_RUNTIME["min_bets_for_tuning"])
+OBJECTIVE_MODE = str(BACKTEST_TUNING_RUNTIME["objective_mode"])
+LAMBDA_BETS = float(BACKTEST_TUNING_RUNTIME["lambda_bets"])
+MAX_BETS_INCREASE_PCT = float(BACKTEST_TUNING_RUNTIME["max_bets_increase_pct"])
+FALLBACK_EPS_ROI_PCT = float(BACKTEST_TUNING_RUNTIME["fallback_eps_roi_pct"])
+RESTRICTED_TUNING_MODE = bool(BACKTEST_TUNING_RUNTIME["restricted_tuning_mode"])
+RESTRICTED_FIXED_MIN_EV = float(BACKTEST_TUNING_RUNTIME["restricted_fixed_min_ev"])
+RESTRICTED_FIXED_PROB_SHRINK = float(BACKTEST_TUNING_RUNTIME["restricted_fixed_prob_shrink"])
+RESTRICTED_MIN_EDGE_VALUES = [float(v) for v in BACKTEST_TUNING_RUNTIME["restricted_min_edge_values"]]
+RESTRICTED_MIN_CONFIDENCE_VALUES = [float(v) for v in BACKTEST_TUNING_RUNTIME["restricted_min_confidence_values"]]
+FOLD_FREQ = str(BACKTEST_TUNING_RUNTIME["fold_freq"])
 
 STRESS_SCENARIOS = [
     {"name": "baseline", "payout_haircut_pct": 0.00, "commission_pct": 0.00, "slippage_pct": 0.00},
@@ -143,6 +261,7 @@ def freeze_baseline_config(config, path=BASELINE_CONFIG_FILE):
         "active_model": ACTIVE_MODEL,
         "features_file": FEATURES_FILE,
         "odds_file": ODDS_FILE_LOCAL,
+        "tuning_runtime": BACKTEST_TUNING_RUNTIME,
         "config": config,
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -1116,11 +1235,51 @@ def config_conservativeness_score(cfg):
     )
 
 
-def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_label="Tuning", print_progress=False):
-    score_formula = "roi - 0.50*max_drawdown_pct + 0.05*min(profit_factor,2.0) - penalty_low_bets - gate_penalty"
+def compute_tuning_objective(train_roi, n_bets, n_matches_train):
+    roi = float(train_roi)
+    bets = float(n_bets)
+    n_matches = max(1.0, float(n_matches_train))
+    if OBJECTIVE_MODE == "roi_minus_lambda_bets":
+        return roi - float(LAMBDA_BETS) * bets
+    return roi - float(LAMBDA_BETS) * (bets / n_matches)
+
+
+def build_tuning_search_space():
+    if RESTRICTED_TUNING_MODE:
+        keys = ["min_edge", "min_confidence"]
+        combos = list(itertools.product(RESTRICTED_MIN_EDGE_VALUES, RESTRICTED_MIN_CONFIDENCE_VALUES))
+        return keys, combos, True
     keys = list(TUNING_GRID.keys())
-    full_combos = list(itertools.product(*[TUNING_GRID[k] for k in keys]))
-    sampled_mode = len(full_combos) > MAX_TUNING_EVALS
+    combos = list(itertools.product(*[TUNING_GRID[k] for k in keys]))
+    return keys, combos, False
+
+
+def _guardrail_reason(bets, max_allowed):
+    if float(bets) <= float(max_allowed) + 1e-9:
+        return "ok"
+    return f"bets_above_guardrail:{int(bets)}>{float(max_allowed):.2f}"
+
+
+def build_fold_period_columns(date_series, fold_freq):
+    freq = str(fold_freq).strip().lower()
+    if freq == "halfyear":
+        years = date_series.dt.year.astype(int)
+        half = np.where(date_series.dt.month <= 6, 1, 2)
+        half_s = pd.Series(half, index=date_series.index)
+        labels = years.astype(str) + "H" + half_s.astype(str)
+        sort_key = years * 2 + (half_s - 1)
+        return labels.astype(str), sort_key.astype(int)
+
+    q = date_series.dt.to_period("Q")
+    labels = q.astype(str)
+    sort_key = q.dt.year * 4 + q.dt.quarter
+    return labels.astype(str), sort_key.astype(int)
+
+
+def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_label="Tuning", print_progress=False):
+    objective_formula = f"{OBJECTIVE_MODE} (lambda={LAMBDA_BETS})"
+    keys, full_combos, restricted_mode = build_tuning_search_space()
+    sampled_mode = (not restricted_mode) and len(full_combos) > MAX_TUNING_EVALS
     if sampled_mode:
         rng = np.random.default_rng(TUNING_RANDOM_SEED)
         sampled_idx = rng.choice(len(full_combos), size=MAX_TUNING_EVALS, replace=False)
@@ -1128,32 +1287,50 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
     else:
         combos = list(full_combos)
 
+    if "odds_row_id" in df_train.columns and not df_train.empty:
+        n_matches_train = int(df_train["odds_row_id"].nunique())
+    else:
+        n_matches_train = int(len(df_train))
+
+    baseline_res = simulate_strategy(
+        df_train,
+        baseline_config,
+        initial_bankroll=1000.0,
+        compute_bootstrap=False,
+        calibrator=calibrator,
+    )
+    baseline_objective = compute_tuning_objective(baseline_res["roi"], baseline_res["bets"], n_matches_train)
+    baseline_bets = int(baseline_res["bets"])
+    max_bets_allowed = float(baseline_bets) * (1.0 + float(MAX_BETS_INCREASE_PCT))
+
     rows = []
     candidates = []
 
     def evaluate_combo(values):
         cfg = dict(baseline_config)
+        if restricted_mode:
+            cfg["min_ev"] = float(RESTRICTED_FIXED_MIN_EV)
+            cfg["prob_shrink"] = float(RESTRICTED_FIXED_PROB_SHRINK)
         for k, v in zip(keys, values):
             cfg[k] = float(v)
 
         res = simulate_strategy(df_train, cfg, initial_bankroll=1000.0, compute_bootstrap=False, calibrator=calibrator)
-        pf = float(res["profit_factor"]) if np.isfinite(res["profit_factor"]) else 2.0
-        pf = min(pf, 2.0)
-        penalty_low_bets = max(0, MIN_BETS_FOR_TUNING - int(res["bets"])) * 0.15
-        gate_penalty = 5.0 if float(res["max_drawdown_pct"]) > 5.0 else 0.0
-        score = float(res["roi"]) - 0.50 * float(res["max_drawdown_pct"]) + 0.05 * pf - penalty_low_bets - gate_penalty
+        objective = compute_tuning_objective(res["roi"], res["bets"], n_matches_train)
         cons = config_conservativeness_score(cfg)
-        feasible_gate = float(res["max_drawdown_pct"]) <= 5.0 and int(res["bets"]) >= MIN_BETS_FOR_TUNING
+        feasible_gate = float(res["max_drawdown_pct"]) <= 5.0 and int(res["bets"]) >= int(MIN_BETS_FOR_TUNING)
+        guardrail_reason = _guardrail_reason(res["bets"], max_bets_allowed)
+        guardrail_passed = guardrail_reason == "ok"
 
         row = {
-            "score": float(score),
+            "score": float(objective),
+            "objective": float(objective),
             "roi": float(res["roi"]),
             "max_dd": float(res["max_drawdown_pct"]),
             "bets": int(res["bets"]),
-            "profit_factor": pf,
-            "penalty_low_bets": penalty_low_bets,
-            "gate_penalty": gate_penalty,
             "feasible_gate": bool(feasible_gate),
+            "guardrail_passed": bool(guardrail_passed),
+            "guardrail_reason": guardrail_reason,
+            "objective_delta_vs_baseline": float(objective - baseline_objective),
             "conservativeness": cons,
             "min_edge": cfg["min_edge"],
             "min_ev": cfg["min_ev"],
@@ -1171,9 +1348,11 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
         cand = {
             "cfg": cfg,
             "res": res,
-            "score": float(score),
+            "objective": float(objective),
             "cons": float(cons),
             "feasible_gate": bool(feasible_gate),
+            "guardrail_passed": bool(guardrail_passed),
+            "guardrail_reason": guardrail_reason,
             "values": tuple(float(v) for v in values),
         }
         return row, cand
@@ -1189,7 +1368,7 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
 
     refinement_evals = 0
     if sampled_mode and candidates and TUNING_REFINEMENT_TOPK > 0:
-        top = sorted(candidates, key=lambda x: (x["score"], x["cons"]), reverse=True)[: int(TUNING_REFINEMENT_TOPK)]
+        top = sorted(candidates, key=lambda x: (x["objective"], x["cons"]), reverse=True)[: int(TUNING_REFINEMENT_TOPK)]
         key_to_vals = {k: [float(v) for v in TUNING_GRID[k]] for k in keys}
         key_to_idx = {k: {float(v): i for i, v in enumerate(vals)} for k, vals in key_to_vals.items()}
         seen = set(c["values"] for c in candidates)
@@ -1220,37 +1399,66 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
             if print_progress and (i % refine_step == 0 or i == len(refine_values)):
                 print(f"    {progress_label} refine {render_progress_bar(i, len(refine_values))}")
 
-    if not candidates:
+    sorted_candidates = sorted(candidates, key=lambda x: (x["objective"], x["cons"]), reverse=True) if candidates else []
+    feasible_pool = [c for c in sorted_candidates if c["feasible_gate"]]
+    guardrail_pool = [c for c in feasible_pool if c["guardrail_passed"]]
+
+    selected = None
+    selection_reason = "baseline_fallback_no_candidates"
+    selected_guardrail_passed = True
+    selected_guardrail_reason = "baseline_fallback"
+
+    if guardrail_pool:
+        selected = guardrail_pool[0]
+        selection_reason = "tuned_guardrail_pass"
+        selected_guardrail_passed = True
+        selected_guardrail_reason = selected["guardrail_reason"]
+    elif feasible_pool:
+        selection_reason = "baseline_fallback_guardrail_failed"
+        selected_guardrail_passed = False
+        selected_guardrail_reason = feasible_pool[0]["guardrail_reason"]
+    elif sorted_candidates:
+        selection_reason = "baseline_fallback_no_feasible_candidates"
+        selected_guardrail_passed = False
+        selected_guardrail_reason = "no_candidate_with_dd<=5_and_min_bets"
+
+    if selected is not None:
+        selected_obj = float(selected["objective"])
+        selected_roi = float(selected["res"]["roi"])
+        baseline_roi = float(baseline_res["roi"])
+        if selected_obj > baseline_objective and selected_roi < (baseline_roi - float(FALLBACK_EPS_ROI_PCT)):
+            selected = None
+            selection_reason = "baseline_fallback_safety_roi"
+            selected_guardrail_passed = False
+            selected_guardrail_reason = (
+                f"objective_gt_baseline_but_roi_lt_baseline_minus_eps:{selected_roi:.4f}<{baseline_roi - FALLBACK_EPS_ROI_PCT:.4f}"
+            )
+
+    if selected is None:
         best_cfg = dict(baseline_config)
-        best_res = simulate_strategy(df_train, best_cfg, initial_bankroll=1000.0, compute_bootstrap=False, calibrator=calibrator)
-        pf = float(best_res["profit_factor"]) if np.isfinite(best_res["profit_factor"]) else 2.0
-        penalty_low_bets = max(0, MIN_BETS_FOR_TUNING - int(best_res["bets"])) * 0.15
-        gate_penalty = 5.0 if float(best_res["max_drawdown_pct"]) > 5.0 else 0.0
-        best_score = float(best_res["roi"] - 0.50 * best_res["max_drawdown_pct"] + 0.05 * min(pf, 2.0) - penalty_low_bets - gate_penalty)
-        df_tuning = pd.DataFrame(rows)
-        diagnostics = {
-            "score_formula": score_formula,
-            "num_configs_total": int(len(full_combos)),
-            "sampled_mode": bool(sampled_mode),
-            "num_configs_evaluated_stage1": int(len(combos)),
-            "num_configs_evaluated_refinement": int(refinement_evals),
-            "num_configs_evaluated_total": int(len(rows)),
-            "num_configs_dd_le_5": 0,
-            "num_configs_feasible": 0,
-            "selected_from_feasible_pool": False,
-        }
-        return best_cfg, best_res, float(best_score), df_tuning, diagnostics
+        best_res = baseline_res
+        best_objective = float(baseline_objective)
+        selected_is_tuned = False
+    else:
+        best_cfg = selected["cfg"]
+        best_res = selected["res"]
+        best_objective = float(selected["objective"])
+        selected_is_tuned = True
 
-    feasible_pool = [c for c in candidates if c["feasible_gate"]]
-    search_pool = feasible_pool if feasible_pool else candidates
-    best = sorted(search_pool, key=lambda x: (x["score"], x["cons"]), reverse=True)[0]
-    best_cfg = best["cfg"]
-    best_res = best["res"]
-    best_score = float(best["score"])
+    df_tuning = pd.DataFrame(rows)
+    if not df_tuning.empty:
+        df_tuning = df_tuning.sort_values(["objective", "conservativeness"], ascending=[False, False]).reset_index(drop=True)
 
-    df_tuning = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
     diagnostics = {
-        "score_formula": score_formula,
+        "objective_formula": objective_formula,
+        "score_formula": objective_formula,
+        "objective_mode": OBJECTIVE_MODE,
+        "lambda_bets": float(LAMBDA_BETS),
+        "num_matches_train": int(n_matches_train),
+        "min_bets_for_tuning": int(MIN_BETS_FOR_TUNING),
+        "max_bets_increase_pct": float(MAX_BETS_INCREASE_PCT),
+        "fallback_eps_roi_pct": float(FALLBACK_EPS_ROI_PCT),
+        "restricted_tuning_mode": bool(restricted_mode),
         "num_configs_total": int(len(full_combos)),
         "sampled_mode": bool(sampled_mode),
         "num_configs_evaluated_stage1": int(len(combos)),
@@ -1258,9 +1466,23 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
         "num_configs_evaluated_total": int(len(rows)),
         "num_configs_dd_le_5": int(sum(1 for c in candidates if c["res"]["max_drawdown_pct"] <= 5.0)),
         "num_configs_feasible": int(len(feasible_pool)),
-        "selected_from_feasible_pool": bool(len(feasible_pool) > 0),
+        "num_configs_guardrail_pass": int(len(guardrail_pool)),
+        "max_bets_allowed_from_baseline": float(max_bets_allowed),
+        "baseline_train_roi": float(baseline_res["roi"]),
+        "baseline_train_bets": int(baseline_res["bets"]),
+        "baseline_objective": float(baseline_objective),
+        "selected_train_roi": float(best_res["roi"]),
+        "selected_train_bets": int(best_res["bets"]),
+        "selected_objective": float(best_objective),
+        "selected_is_tuned": bool(selected_is_tuned),
+        "selected_guardrail_passed": bool(selected_guardrail_passed),
+        "selected_guardrail_reason": selected_guardrail_reason,
+        "selected_from_feasible_pool": bool(selected_is_tuned),
+        "selection_reason": selection_reason,
+        "objective_delta_vs_baseline": float(best_objective - baseline_objective),
+        "roi_delta_vs_baseline": float(best_res["roi"] - baseline_res["roi"]),
     }
-    return best_cfg, best_res, float(best_score), df_tuning, diagnostics
+    return best_cfg, best_res, float(best_objective), df_tuning, diagnostics
 
 
 def build_calibration_report(df_sim, baseline_config, calibrator=None, bins=10):
@@ -1447,16 +1669,22 @@ def run_stress_tests(df_sim, baseline_config, calibrator=None, baseline_selectio
 
 
 def run_walk_forward_validation(df_sim, baseline_config):
-    print("\n[9] Walk-Forward Multi-Split (quarterly)...")
+    print(f"\n[9] Walk-Forward Multi-Split ({FOLD_FREQ})...")
     if df_sim.empty:
         print("    [WARN] Dataset vuoto. Salto walk-forward.")
         return None
 
     tmp = df_sim.copy()
-    tmp["quarter"] = tmp["tourney_date"].dt.to_period("Q")
-    quarters = sorted(tmp["quarter"].unique())
-    if len(quarters) < 3:
-        print("    [WARN] Non abbastanza quarter per walk-forward.")
+    tmp["test_period"], tmp["_fold_sort"] = build_fold_period_columns(tmp["tourney_date"], FOLD_FREQ)
+    periods = (
+        tmp[["test_period", "_fold_sort"]]
+        .drop_duplicates()
+        .sort_values("_fold_sort")
+        .reset_index(drop=True)["test_period"]
+        .tolist()
+    )
+    if len(periods) < 3:
+        print(f"    [WARN] Non abbastanza periodi per walk-forward (freq={FOLD_FREQ}).")
         return None
 
     baseline_bank = 1000.0
@@ -1464,14 +1692,14 @@ def run_walk_forward_validation(df_sim, baseline_config):
     n_valid_folds = 0
     rows = []
 
-    total_folds = len(quarters) - 1
-    for i in range(1, len(quarters)):
+    total_folds = len(periods) - 1
+    for i in range(1, len(periods)):
         print(f"    WF progress {render_progress_bar(i, total_folds)}")
-        train_quarters = quarters[:i]
-        test_quarter = quarters[i]
+        train_periods = periods[:i]
+        test_period = periods[i]
 
-        df_train = tmp[tmp["quarter"].isin(train_quarters)].copy()
-        df_test = tmp[tmp["quarter"] == test_quarter].copy()
+        df_train = tmp[tmp["test_period"].isin(train_periods)].copy()
+        df_test = tmp[tmp["test_period"] == test_period].copy()
 
         train_matches = int(df_train["odds_row_id"].nunique()) if not df_train.empty else 0
         test_matches = int(df_test["odds_row_id"].nunique()) if not df_test.empty else 0
@@ -1487,20 +1715,31 @@ def run_walk_forward_validation(df_sim, baseline_config):
         if not fold_valid:
             rows.append(
                 {
-                    "test_quarter": str(test_quarter),
+                    "test_period": str(test_period),
+                    "test_quarter": str(test_period) if FOLD_FREQ == "quarter" else None,
                     "train_matches": train_matches,
                     "test_matches": test_matches,
                     "fold_valid": False,
                     "skip_reason": skip_reason,
-                "train_best_score": np.nan,
-                "train_best_roi": np.nan,
-                "train_baseline_roi": np.nan,
-                "train_tuned_adv_roi": np.nan,
-                "use_tuned_policy": np.nan,
-                "tuned_not_worse": np.nan,
-                "baseline_test_roi": np.nan,
-                "tuned_test_roi": np.nan,
-                "baseline_test_bets": 0,
+                    "train_best_score": np.nan,
+                    "train_best_roi": np.nan,
+                    "train_baseline_roi": np.nan,
+                    "train_tuned_adv_roi": np.nan,
+                    "baseline_train_bets": np.nan,
+                    "tuned_train_bets": np.nan,
+                    "objective_best": np.nan,
+                    "objective_baseline": np.nan,
+                    "objective_delta_vs_baseline": np.nan,
+                    "bets_increase_pct_vs_baseline_train": np.nan,
+                    "guardrail_passed": False,
+                    "guardrail_reason": f"fold_invalid:{skip_reason}",
+                    "restricted_tuning_mode": bool(RESTRICTED_TUNING_MODE),
+                    "selection_reason": "fold_invalid",
+                    "use_tuned_policy": np.nan,
+                    "tuned_not_worse": np.nan,
+                    "baseline_test_roi": np.nan,
+                    "tuned_test_roi": np.nan,
+                    "baseline_test_bets": 0,
                     "tuned_test_bets": 0,
                     "baseline_bankroll_end": baseline_bank,
                     "tuned_bankroll_end": tuned_bank,
@@ -1513,11 +1752,11 @@ def run_walk_forward_validation(df_sim, baseline_config):
             continue
 
         fold_calibrator = fit_probability_calibrator(df_train)
-        best_cfg, best_h_train, best_score, _, _ = tune_strategy_config(
+        best_cfg, best_h_train, best_score, _, tuning_diag = tune_strategy_config(
             df_train,
             baseline_config,
             calibrator=fold_calibrator,
-            progress_label=f"WF {test_quarter}",
+            progress_label=f"WF {test_period}",
             print_progress=True,
         )
         base_train = simulate_strategy(
@@ -1527,9 +1766,24 @@ def run_walk_forward_validation(df_sim, baseline_config):
             compute_bootstrap=False,
             calibrator=fold_calibrator,
         )
+        base_objective = compute_tuning_objective(base_train["roi"], base_train["bets"], train_matches)
+        best_objective = float(best_score)
         tuned_train_adv = float(best_h_train["roi"]) - float(base_train["roi"])
-        use_tuned_policy = tuned_train_adv >= WF_TUNED_TRAIN_ADV_THRESHOLD
+        selected_is_tuned = bool(tuning_diag.get("selected_is_tuned", False))
+        use_tuned_policy = bool(selected_is_tuned and tuned_train_adv >= WF_TUNED_TRAIN_ADV_THRESHOLD)
         selected_cfg = best_cfg if use_tuned_policy else dict(baseline_config)
+        baseline_train_bets = int(base_train["bets"])
+        tuned_train_bets = int(best_h_train["bets"])
+        if baseline_train_bets > 0:
+            bets_increase_pct = (float(tuned_train_bets - baseline_train_bets) / float(baseline_train_bets)) * 100.0
+        else:
+            bets_increase_pct = np.nan
+
+        objective_delta = float(best_objective - base_objective)
+        roi_delta = float(tuned_train_adv)
+        guardrail_passed = bool(tuning_diag.get("selected_guardrail_passed", True))
+        guardrail_reason = str(tuning_diag.get("selected_guardrail_reason", "ok"))
+        selection_reason = str(tuning_diag.get("selection_reason", "n/a"))
 
         base_test = simulate_strategy(
             df_test,
@@ -1546,9 +1800,24 @@ def run_walk_forward_validation(df_sim, baseline_config):
             calibrator=fold_calibrator,
         )
 
+        bets_delta_txt = f"{bets_increase_pct:+.2f}%" if np.isfinite(bets_increase_pct) else "n/a"
+        print(
+            f"    Fold {test_period} | Train bets baseline/tuned: {baseline_train_bets}/{tuned_train_bets} "
+            f"(delta {bets_delta_txt})"
+        )
+        print(
+            f"    Fold {test_period} | Train ROI delta: {roi_delta:+.2f}% | "
+            f"Objective delta: {objective_delta:+.4f} | Guardrail: {guardrail_passed} ({guardrail_reason})"
+        )
+        print(
+            f"    Fold {test_period} | Selected policy: {'tuned' if use_tuned_policy else 'baseline'} "
+            f"(selection_reason={selection_reason})"
+        )
+
         rows.append(
             {
-                "test_quarter": str(test_quarter),
+                "test_period": str(test_period),
+                "test_quarter": str(test_period) if FOLD_FREQ == "quarter" else None,
                 "train_matches": train_matches,
                 "test_matches": test_matches,
                 "fold_valid": True,
@@ -1557,6 +1826,16 @@ def run_walk_forward_validation(df_sim, baseline_config):
                 "train_best_roi": best_h_train["roi"],
                 "train_baseline_roi": base_train["roi"],
                 "train_tuned_adv_roi": tuned_train_adv,
+                "baseline_train_bets": baseline_train_bets,
+                "tuned_train_bets": tuned_train_bets,
+                "objective_best": float(best_objective),
+                "objective_baseline": float(base_objective),
+                "objective_delta_vs_baseline": float(objective_delta),
+                "bets_increase_pct_vs_baseline_train": float(bets_increase_pct) if np.isfinite(bets_increase_pct) else np.nan,
+                "guardrail_passed": bool(guardrail_passed),
+                "guardrail_reason": guardrail_reason,
+                "restricted_tuning_mode": bool(tuning_diag.get("restricted_tuning_mode", RESTRICTED_TUNING_MODE)),
+                "selection_reason": selection_reason,
                 "use_tuned_policy": bool(use_tuned_policy),
                 "tuned_not_worse": bool(float(tuned_test["roi"]) >= float(base_test["roi"])),
                 "baseline_test_roi": base_test["roi"],
@@ -1605,6 +1884,9 @@ def run_walk_forward_validation(df_sim, baseline_config):
     )
 
     wf_report = {
+        "fold_freq": FOLD_FREQ,
+        "objective_mode": OBJECTIVE_MODE,
+        "lambda_bets": float(LAMBDA_BETS),
         "overall_baseline_roi": float(overall_baseline_roi),
         "overall_tuned_roi": float(overall_tuned_roi),
         "overall_tuned_vs_baseline_roi_diff": float(overall_tuned_vs_baseline_roi_diff)
@@ -1661,9 +1943,17 @@ def run_temporal_validation(df_sim, baseline_config):
     print(f"    Baseline H2 ROI: {baseline_h2['roi']:.2f}% | Bets: {baseline_h2['bets']}")
     print(f"    Calibrator selezionato su H1: {calibrator_h1['name']}")
 
-    keys = list(TUNING_GRID.keys())
-    combos = list(itertools.product(*[TUNING_GRID[k] for k in keys]))
-    print(f"    Tuning grid size: {len(combos)} combinazioni")
+    if RESTRICTED_TUNING_MODE:
+        combos_count = len(RESTRICTED_MIN_EDGE_VALUES) * len(RESTRICTED_MIN_CONFIDENCE_VALUES)
+        print(
+            "    Tuning mode: restricted | "
+            f"grid size: {combos_count} (min_edge x min_confidence), "
+            f"fixed min_ev={RESTRICTED_FIXED_MIN_EV}, fixed prob_shrink={RESTRICTED_FIXED_PROB_SHRINK}"
+        )
+    else:
+        keys = list(TUNING_GRID.keys())
+        combos_count = len(list(itertools.product(*[TUNING_GRID[k] for k in keys])))
+        print(f"    Tuning mode: full | grid size: {combos_count} combinazioni")
 
     best_cfg, best_h1, best_score, df_tuning, tuning_diag = tune_strategy_config(
         df_h1,
@@ -1680,11 +1970,12 @@ def run_temporal_validation(df_sim, baseline_config):
         compute_bootstrap=True,
         calibrator=calibrator_h1,
     )
-    print(f"    Best H1 ROI: {best_h1['roi']:.2f}% | Bets: {best_h1['bets']} | Score: {best_score:.2f}")
+    print(f"    Best H1 ROI: {best_h1['roi']:.2f}% | Bets: {best_h1['bets']} | Objective: {best_score:.4f}")
     print(f"    Tuned H2 ROI: {tuned_h2['roi']:.2f}% | Bets: {tuned_h2['bets']}")
 
     print("\n    Top 10 combinazioni H1:")
     cols = [
+        "objective",
         "score",
         "roi",
         "max_dd",
@@ -1717,6 +2008,7 @@ def run_temporal_validation(df_sim, baseline_config):
             "roi": best_h1["roi"],
             "bets": best_h1["bets"],
             "max_drawdown_pct": best_h1["max_drawdown_pct"],
+            "objective": best_score,
             "score": best_score,
         },
         "tuned_h2_result": {
@@ -1862,6 +2154,11 @@ def run_backtest_v7():
     print(f"[MODEL] Active run_id: {ACTIVE_MODEL.get('run_id')}")
     print(f"[MODEL] model_path: {MODEL_FILE}")
     print(f"[MODEL] features_path: {MODEL_FEATURES_FILE}")
+    print(
+        f"[TUNING] min_bets={MIN_BETS_FOR_TUNING} | objective_mode={OBJECTIVE_MODE} | "
+        f"lambda_bets={LAMBDA_BETS} | guardrail_max_bets_inc={MAX_BETS_INCREASE_PCT:.2f} | "
+        f"restricted_mode={RESTRICTED_TUNING_MODE} | fold_freq={FOLD_FREQ}"
+    )
 
     # 1. INITIALIZE NORMALIZER
     print("[1] Inizializzazione Normalizzatore (Training Set)...")
@@ -1988,6 +2285,7 @@ def run_backtest_v7():
     # Consolidated report
     consolidated = {
         "baseline_config": BASELINE_CONFIG,
+        "tuning_runtime": BACKTEST_TUNING_RUNTIME,
         "active_model": ACTIVE_MODEL,
         "merge_stats": merge_stats,
         "baseline_result": {
