@@ -2,6 +2,7 @@ import itertools
 import json
 import os
 import sys
+import uuid
 
 import joblib
 import matplotlib.pyplot as plt
@@ -33,6 +34,43 @@ STRESS_REPORT_FILE = "backtest_stress_report.json"
 RELIABILITY_PLOT_FILE = "reliability_curve.png"
 RELIABILITY_TABLE_FILE = "reliability_table.csv"
 BACKTEST_TUNING_CONFIG_FILE = "configs/backtest_tuning.json"
+RUNS_DIR = "runs"
+SCORECARD_HISTORY_FILE = os.path.join(RUNS_DIR, "scorecard_history.csv")
+LIVE_BETS_LOG_FILE = os.path.join(RUNS_DIR, "live_bets_log.csv")
+SCORECARD_COLUMNS = [
+    "timestamp_utc",
+    "backtest_run_id",
+    "active_model_run_id",
+    "fold_freq",
+    "objective_mode",
+    "baseline_roi_pct",
+    "baseline_bets",
+    "baseline_max_drawdown_pct",
+    "walkforward_baseline_roi_pct",
+    "walkforward_tuned_roi_pct",
+    "walkforward_tuned_vs_baseline_roi_diff_pct",
+    "oos_gate_status",
+    "oos_gate_pass",
+    "promotion_status",
+    "oos_reasons",
+    "promotion_reasons",
+]
+LIVE_BETS_COLUMNS = [
+    "timestamp_utc",
+    "backtest_run_id",
+    "match_id",
+    "date",
+    "player_1",
+    "player_2",
+    "surface",
+    "level",
+    "bookmaker_odds_p1",
+    "model_prob_p1",
+    "stake",
+    "result",
+    "pnl",
+    "bankroll_after",
+]
 
 
 DEFAULT_TUNING_RUNTIME = {
@@ -243,6 +281,160 @@ STRESS_SCENARIOS = [
 ]
 
 
+def _utc_now_iso():
+    return pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_backtest_run_context():
+    ts = _utc_now_iso()
+    run_id = f"bt_{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    return {
+        "run_id": run_id,
+        "generated_at_utc": ts,
+        "active_model_run_id": ACTIVE_MODEL.get("run_id"),
+        "fold_freq": FOLD_FREQ,
+        "objective_mode": OBJECTIVE_MODE,
+    }
+
+
+def add_report_metadata(payload, run_context=None):
+    out = dict(payload)
+    if run_context:
+        out["backtest_run_id"] = run_context.get("run_id")
+        out["backtest_generated_at_utc"] = run_context.get("generated_at_utc")
+        out["active_model_run_id"] = run_context.get("active_model_run_id")
+    return out
+
+
+def ensure_runs_artifacts():
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    created_files = []
+
+    if not os.path.exists(SCORECARD_HISTORY_FILE):
+        pd.DataFrame(columns=SCORECARD_COLUMNS).to_csv(SCORECARD_HISTORY_FILE, index=False)
+        created_files.append(SCORECARD_HISTORY_FILE)
+
+    if not os.path.exists(LIVE_BETS_LOG_FILE):
+        pd.DataFrame(columns=LIVE_BETS_COLUMNS).to_csv(LIVE_BETS_LOG_FILE, index=False)
+        created_files.append(LIVE_BETS_LOG_FILE)
+
+    return {
+        "runs_dir": RUNS_DIR,
+        "scorecard_history_file": SCORECARD_HISTORY_FILE,
+        "live_bets_log_file": LIVE_BETS_LOG_FILE,
+        "created_files": created_files,
+    }
+
+
+def evaluate_report_coherence(consolidated, run_context):
+    checks = {}
+    reasons = []
+    expected_run_id = str((run_context or {}).get("run_id") or "")
+    expected_ts = str((run_context or {}).get("generated_at_utc") or "")
+
+    walk = consolidated.get("walk_forward") or {}
+    stress = consolidated.get("stress_tests") or {}
+    baseline_snapshot = consolidated.get("baseline_config_snapshot") or {}
+    tuning_runtime = consolidated.get("tuning_runtime") or {}
+
+    checks["walk_forward_present"] = bool(isinstance(walk, dict) and walk)
+    checks["stress_report_present"] = bool(isinstance(stress, dict) and stress)
+    checks["baseline_snapshot_present"] = bool(isinstance(baseline_snapshot, dict) and baseline_snapshot)
+    if not checks["walk_forward_present"]:
+        reasons.append("walk_forward_missing")
+    if not checks["stress_report_present"]:
+        reasons.append("stress_report_missing")
+    if not checks["baseline_snapshot_present"]:
+        reasons.append("baseline_snapshot_missing")
+
+    for label, report in [
+        ("walk_forward", walk),
+        ("stress_report", stress),
+        ("baseline_snapshot", baseline_snapshot),
+    ]:
+        if not isinstance(report, dict) or not report:
+            checks[f"{label}_run_id_match"] = False
+            checks[f"{label}_timestamp_match"] = False
+            continue
+        rid = str(report.get("backtest_run_id") or "")
+        ts = str(report.get("backtest_generated_at_utc") or "")
+        checks[f"{label}_run_id_match"] = bool(expected_run_id and rid == expected_run_id)
+        checks[f"{label}_timestamp_match"] = bool(expected_ts and ts == expected_ts)
+        if not checks[f"{label}_run_id_match"]:
+            reasons.append(f"{label}_run_id_mismatch")
+        if not checks[f"{label}_timestamp_match"]:
+            reasons.append(f"{label}_timestamp_mismatch")
+
+    wf_freq = str(walk.get("fold_freq", "")).strip().lower() if isinstance(walk, dict) else ""
+    expected_freq = str(FOLD_FREQ).strip().lower()
+    runtime_freq = str(tuning_runtime.get("fold_freq", "")).strip().lower() if isinstance(tuning_runtime, dict) else ""
+    checks["walk_forward_fold_freq_match"] = bool(wf_freq and wf_freq == expected_freq)
+    checks["walk_forward_vs_runtime_fold_freq_match"] = bool(wf_freq and runtime_freq and wf_freq == runtime_freq)
+    if not checks["walk_forward_fold_freq_match"]:
+        reasons.append("walk_forward_fold_freq_mismatch")
+    if not checks["walk_forward_vs_runtime_fold_freq_match"]:
+        reasons.append("walk_forward_vs_runtime_fold_freq_mismatch")
+
+    passed = all(checks.values()) if checks else False
+    return {
+        "pass": bool(passed),
+        "checks": checks,
+        "reasons": reasons,
+    }
+
+
+def enforce_report_coherence_on_oos_gate(oos_gate, report_coherence):
+    gate = dict(oos_gate or {})
+    checks = dict(gate.get("checks") or {})
+    reasons = list(gate.get("reasons") or [])
+
+    coherence_pass = bool((report_coherence or {}).get("pass", False))
+    checks["report_coherence"] = coherence_pass
+    if not coherence_pass:
+        if "report_coherence_failed" not in reasons:
+            reasons.append("report_coherence_failed")
+        for reason in (report_coherence or {}).get("reasons", []):
+            tagged = f"report_coherence:{reason}"
+            if tagged not in reasons:
+                reasons.append(tagged)
+        gate["status"] = "NO_GO"
+        gate["pass"] = False
+
+    gate["checks"] = checks
+    gate["reasons"] = reasons
+    return gate
+
+
+def append_scorecard_history(consolidated, run_context):
+    baseline = consolidated.get("baseline_result") or {}
+    walk = consolidated.get("walk_forward") or {}
+    oos = consolidated.get("oos_gate") or {}
+    promo = consolidated.get("promotion_decision") or {}
+
+    row = {
+        "timestamp_utc": (run_context or {}).get("generated_at_utc"),
+        "backtest_run_id": (run_context or {}).get("run_id"),
+        "active_model_run_id": (run_context or {}).get("active_model_run_id"),
+        "fold_freq": (run_context or {}).get("fold_freq"),
+        "objective_mode": (run_context or {}).get("objective_mode"),
+        "baseline_roi_pct": baseline.get("roi"),
+        "baseline_bets": baseline.get("bets"),
+        "baseline_max_drawdown_pct": baseline.get("max_drawdown_pct"),
+        "walkforward_baseline_roi_pct": walk.get("overall_baseline_roi"),
+        "walkforward_tuned_roi_pct": walk.get("overall_tuned_roi"),
+        "walkforward_tuned_vs_baseline_roi_diff_pct": walk.get("overall_tuned_vs_baseline_roi_diff"),
+        "oos_gate_status": oos.get("status"),
+        "oos_gate_pass": oos.get("pass"),
+        "promotion_status": promo.get("status"),
+        "oos_reasons": "|".join(oos.get("reasons", [])),
+        "promotion_reasons": "|".join(promo.get("reasons", [])),
+    }
+    row_df = pd.DataFrame([{col: row.get(col) for col in SCORECARD_COLUMNS}])
+    header = not os.path.exists(SCORECARD_HISTORY_FILE) or os.path.getsize(SCORECARD_HISTORY_FILE) == 0
+    row_df.to_csv(SCORECARD_HISTORY_FILE, mode="a", header=header, index=False)
+    return row
+
+
 def render_progress_bar(current, total, width=30):
     total = max(1, int(total))
     current = max(0, min(int(current), total))
@@ -252,7 +444,7 @@ def render_progress_bar(current, total, width=30):
     return f"[{bar}] {ratio * 100:6.2f}% ({current}/{total})"
 
 
-def freeze_baseline_config(config, path=BASELINE_CONFIG_FILE):
+def freeze_baseline_config(config, run_context=None, path=BASELINE_CONFIG_FILE):
     payload = {
         "frozen_at": pd.Timestamp.utcnow().isoformat(),
         "model_file": MODEL_FILE,
@@ -264,9 +456,11 @@ def freeze_baseline_config(config, path=BASELINE_CONFIG_FILE):
         "tuning_runtime": BACKTEST_TUNING_RUNTIME,
         "config": config,
     }
+    payload = add_report_metadata(payload, run_context)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     print(f"    Baseline config salvata in: {path}")
+    return payload
 
 
 def get_model_features(df_feats):
@@ -1594,7 +1788,7 @@ def build_calibration_report(df_sim, baseline_config, calibrator=None, bins=10):
     return report, grouped
 
 
-def run_stress_tests(df_sim, baseline_config, calibrator=None, baseline_selection=None):
+def run_stress_tests(df_sim, baseline_config, calibrator=None, baseline_selection=None, run_context=None):
     print("\n[8] Stress Test (haircut + commission + slippage)...")
     fixed_rows = []
     adaptive_rows = []
@@ -1662,13 +1856,14 @@ def run_stress_tests(df_sim, baseline_config, calibrator=None, baseline_selectio
     payload["fixed_mode_monotonic_non_increasing_roi"] = monotonic_non_increasing
     if not monotonic_non_increasing:
         print("    [WARN] Fixed mode ROI non monotono rispetto ai costi.")
+    payload = add_report_metadata(payload, run_context)
     with open(STRESS_REPORT_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     print(f"    Report stress salvato in: {STRESS_REPORT_FILE}")
     return payload
 
 
-def run_walk_forward_validation(df_sim, baseline_config):
+def run_walk_forward_validation(df_sim, baseline_config, run_context=None):
     print(f"\n[9] Walk-Forward Multi-Split ({FOLD_FREQ})...")
     if df_sim.empty:
         print("    [WARN] Dataset vuoto. Salto walk-forward.")
@@ -1903,6 +2098,7 @@ def run_walk_forward_validation(df_sim, baseline_config):
         },
         "rows": wf_df.to_dict(orient="records"),
     }
+    wf_report = add_report_metadata(wf_report, run_context)
     with open(WALKFORWARD_REPORT_FILE, "w", encoding="utf-8") as f:
         json.dump(wf_report, f, indent=2)
     print(f"    Report walk-forward salvato in: {WALKFORWARD_REPORT_FILE}")
@@ -2106,12 +2302,14 @@ def build_promotion_decision(consolidated):
     baseline_result = consolidated.get("baseline_result") or {}
     no_odds = consolidated.get("no_odds_eval") or {}
     no_odds_gate = no_odds.get("gate") or {}
+    report_coherence = consolidated.get("report_coherence") or {}
 
     wf_baseline = walk.get("overall_baseline_roi")
     wf_tuned = walk.get("overall_tuned_roi")
     mdd = baseline_result.get("max_drawdown_pct")
     no_odds_status = no_odds_gate.get("status")
 
+    c0 = bool(report_coherence.get("pass", True))
     c1 = bool(oos_gate.get("pass", False))
     c2 = (
         wf_baseline is not None
@@ -2124,6 +2322,8 @@ def build_promotion_decision(consolidated):
     c4 = no_odds_status in {"pass", "insufficient_data"}
 
     reasons = []
+    if not c0:
+        reasons.append("report_coherence_not_passed")
     if not c1:
         reasons.append("oos_gate_not_passed")
     if not c2:
@@ -2133,11 +2333,12 @@ def build_promotion_decision(consolidated):
     if not c4:
         reasons.append("no_odds_eval_gate_not_pass_or_insufficient_data")
 
-    status = "promote" if (c1 and c2 and c3 and c4) else "keep_baseline"
+    status = "promote" if (c0 and c1 and c2 and c3 and c4) else "keep_baseline"
     return {
         "status": status,
         "reasons": reasons,
         "criteria_snapshot": {
+            "report_coherence_pass": bool(c0),
             "oos_gate_pass": bool(c1),
             "walk_forward_overall_baseline_roi": float(wf_baseline) if wf_baseline is not None and np.isfinite(wf_baseline) else None,
             "walk_forward_overall_tuned_roi": float(wf_tuned) if wf_tuned is not None and np.isfinite(wf_tuned) else None,
@@ -2159,6 +2360,17 @@ def run_backtest_v7():
         f"lambda_bets={LAMBDA_BETS} | guardrail_max_bets_inc={MAX_BETS_INCREASE_PCT:.2f} | "
         f"restricted_mode={RESTRICTED_TUNING_MODE} | fold_freq={FOLD_FREQ}"
     )
+    run_context = build_backtest_run_context()
+    print(
+        f"[RUN] backtest_run_id={run_context['run_id']} | "
+        f"generated_at_utc={run_context['generated_at_utc']}"
+    )
+
+    runs_artifacts = ensure_runs_artifacts()
+    if runs_artifacts["created_files"]:
+        print(f"[RUNS] Creati artefatti: {', '.join(runs_artifacts['created_files'])}")
+    else:
+        print("[RUNS] Artefatti runs gia presenti.")
 
     # 1. INITIALIZE NORMALIZER
     print("[1] Inizializzazione Normalizzatore (Training Set)...")
@@ -2224,7 +2436,7 @@ def run_backtest_v7():
 
     # 5. BASELINE SIMULATION
     print("\n[5] Simulazione Value Betting (Fair Odds + Kelly + Top Signals)...")
-    freeze_baseline_config(BASELINE_CONFIG, BASELINE_CONFIG_FILE)
+    baseline_snapshot = freeze_baseline_config(BASELINE_CONFIG, run_context=run_context, path=BASELINE_CONFIG_FILE)
     split_date = pd.Timestamp(H1_H2_SPLIT_DATE)
     df_pre_h2 = df_sim[df_sim["tourney_date"] < split_date].copy()
     global_calibrator = fit_probability_calibrator(df_pre_h2)
@@ -2277,14 +2489,26 @@ def run_backtest_v7():
         BASELINE_CONFIG,
         calibrator=global_calibrator,
         baseline_selection=baseline_result.get("selected_decisions", {}),
+        run_context=run_context,
     )
 
     # 9. WALK-FORWARD MULTI-SPLIT
-    walkforward_report = run_walk_forward_validation(df_sim, BASELINE_CONFIG)
+    walkforward_report = run_walk_forward_validation(df_sim, BASELINE_CONFIG, run_context=run_context)
 
     # Consolidated report
     consolidated = {
+        "backtest_run_id": run_context["run_id"],
+        "backtest_generated_at_utc": run_context["generated_at_utc"],
+        "active_model_run_id": run_context["active_model_run_id"],
+        "report_files": {
+            "validation": VALIDATION_REPORT_FILE,
+            "walkforward": WALKFORWARD_REPORT_FILE,
+            "stress": STRESS_REPORT_FILE,
+            "baseline_config": BASELINE_CONFIG_FILE,
+        },
+        "runs_artifacts": runs_artifacts,
         "baseline_config": BASELINE_CONFIG,
+        "baseline_config_snapshot": baseline_snapshot,
         "tuning_runtime": BACKTEST_TUNING_RUNTIME,
         "active_model": ACTIVE_MODEL,
         "merge_stats": merge_stats,
@@ -2329,18 +2553,37 @@ def run_backtest_v7():
     }
     if no_odds_report is not None:
         consolidated["no_odds_eval"] = no_odds_report
+
+    report_coherence = evaluate_report_coherence(consolidated, run_context)
+    consolidated["report_coherence"] = report_coherence
+    print(
+        f"\n[10] Report coherence check | pass={report_coherence['pass']} | "
+        f"reasons={report_coherence['reasons'] if report_coherence['reasons'] else 'none'}"
+    )
+
     oos_gate = evaluate_oos_gate(consolidated)
+    oos_gate = enforce_report_coherence_on_oos_gate(oos_gate, report_coherence)
     consolidated["oos_gate"] = oos_gate
     promotion_decision = build_promotion_decision(consolidated)
     consolidated["promotion_decision"] = promotion_decision
+
+    try:
+        scorecard_row = append_scorecard_history(consolidated, run_context)
+        consolidated["scorecard_row"] = scorecard_row
+        print(f"[RUNS] Scorecard aggiornata: {SCORECARD_HISTORY_FILE}")
+    except Exception as e:
+        consolidated["scorecard_row_error"] = str(e)
+        print(f"[WARN] Impossibile aggiornare scorecard history: {e}")
+
+    consolidated = add_report_metadata(consolidated, run_context)
     with open(VALIDATION_REPORT_FILE, "w", encoding="utf-8") as f:
         json.dump(consolidated, f, indent=2)
     print(f"\nReport consolidato salvato in: {VALIDATION_REPORT_FILE}")
-    print("\n[10] OOS Gate Decision")
+    print("\n[11] OOS Gate Decision")
     print(f"    Status: {oos_gate['status']} | Pass: {oos_gate['pass']}")
     if oos_gate["reasons"]:
         print(f"    Reasons: {', '.join(oos_gate['reasons'])}")
-    print("\n[11] Promotion Decision")
+    print("\n[12] Promotion Decision")
     print(f"    Status: {promotion_decision['status']}")
     if promotion_decision["reasons"]:
         print(f"    Reasons: {', '.join(promotion_decision['reasons'])}")
