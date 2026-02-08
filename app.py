@@ -2,20 +2,27 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import os
 import json
 import plotly.graph_objects as go
+
+from paths import ensure_data_layout, get_paths, resolve_repo_path
 
 # Page Config
 st.set_page_config(page_title="Tennis Match Predictor", page_icon="🎾", layout="wide")
 
 # Paths
-ACTIVE_MODEL_FILE = "active_model.json"
-MODEL_PATH_DEFAULT = "model.pkl"
-FEAT_PATH_DEFAULT = "model_features.pkl"
-STATS_PATH = "latest_stats.csv"
-ENCODER_PATH = "level_encoder.pkl"
-MATCHES_PATH = "clean_matches.csv"
+PATHS = get_paths()
+REPO_ROOT = PATHS["repo_root"]
+DATA_DIR = PATHS["data_dir"]
+
+ACTIVE_MODEL_FILE = REPO_ROOT / "active_model.json"
+MODEL_PATH_DEFAULT = REPO_ROOT / "model.pkl"
+FEAT_PATH_DEFAULT = REPO_ROOT / "model_features.pkl"
+STATS_PATH = DATA_DIR / "latest_stats.csv"
+ENCODER_PATH = REPO_ROOT / "level_encoder.pkl"
+MATCHES_PATH = DATA_DIR / "clean_matches.csv"
+
+_migration = ensure_data_layout()
 
 
 def resolve_active_model():
@@ -23,13 +30,13 @@ def resolve_active_model():
         "model_path": MODEL_PATH_DEFAULT,
         "features_path": FEAT_PATH_DEFAULT,
     }
-    if not os.path.exists(ACTIVE_MODEL_FILE):
+    if not ACTIVE_MODEL_FILE.exists():
         return payload
     try:
         with open(ACTIVE_MODEL_FILE, "r", encoding="utf-8") as f:
             current = json.load(f)
-        payload["model_path"] = current.get("model_path", MODEL_PATH_DEFAULT)
-        payload["features_path"] = current.get("features_path", FEAT_PATH_DEFAULT)
+        payload["model_path"] = resolve_repo_path(current.get("model_path", str(MODEL_PATH_DEFAULT)), REPO_ROOT)
+        payload["features_path"] = resolve_repo_path(current.get("features_path", str(FEAT_PATH_DEFAULT)), REPO_ROOT)
     except Exception:
         pass
     return payload
@@ -41,8 +48,8 @@ FEAT_PATH = ACTIVE_MODEL["features_path"]
 
 @st.cache_resource
 def load_artifacts():
-    if not os.path.exists(MODEL_PATH): return None, None, None, None, None
-    if not os.path.exists(FEAT_PATH): return None, None, None, None, None
+    if not MODEL_PATH.exists(): return None, None, None, None, None
+    if not FEAT_PATH.exists(): return None, None, None, None, None
     
     model = joblib.load(MODEL_PATH)
     features = joblib.load(FEAT_PATH)

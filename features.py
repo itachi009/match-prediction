@@ -4,6 +4,11 @@ from collections import defaultdict, deque
 from datetime import timedelta
 import tqdm
 
+from paths import ensure_data_layout, get_paths
+
+
+PATHS = get_paths()
+DATA_DIR = PATHS["data_dir"]
 
 # --- ELO CONFIG ---
 START_RATING = 1500
@@ -478,11 +483,14 @@ def process_matches(df):
         maybe_push_ranked_result(p2, 1 - result_p1, r2_raw, r1_raw)
 
     feat_df = pd.DataFrame(features_list)
-    feat_df.to_csv("processed_features.csv", index=False)
-    print("Saved processed_features.csv")
+    processed_csv = DATA_DIR / "processed_features.csv"
+    feat_df.to_csv(processed_csv, index=False)
+    print(f"Saved {processed_csv}")
+
     try:
-        feat_df.to_parquet("processed_features.parquet", index=False)
-        print("Saved processed_features.parquet")
+        processed_parquet = DATA_DIR / "processed_features.parquet"
+        feat_df.to_parquet(processed_parquet, index=False)
+        print(f"Saved {processed_parquet}")
     except Exception as e:
         print(f"[WARN] Could not save processed_features.parquet: {e}")
 
@@ -503,10 +511,18 @@ def process_matches(df):
 
         latest_rows.append(row)
 
-    pd.DataFrame(latest_rows).to_csv("latest_stats.csv", index=False)
-    print("Saved latest_stats.csv")
+    latest_stats_path = DATA_DIR / "latest_stats.csv"
+    pd.DataFrame(latest_rows).to_csv(latest_stats_path, index=False)
+    print(f"Saved {latest_stats_path}")
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("clean_matches.csv")
+    migration = ensure_data_layout()
+    moved = migration.get("moved", [])
+    renamed = migration.get("renamed_dup", [])
+    if moved or renamed:
+        print(f"[DATA_LAYOUT] moved={len(moved)} renamed_dup={len(renamed)}")
+
+    clean_matches_path = DATA_DIR / "clean_matches.csv"
+    df = pd.read_csv(clean_matches_path)
     process_matches(df)

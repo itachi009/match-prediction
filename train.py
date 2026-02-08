@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.model_selection import TimeSeriesSplit
+
+from paths import ensure_data_layout, get_paths, resolve_repo_path
 
 try:
     import xgboost as xgb
@@ -40,10 +43,16 @@ except Exception:
     optuna = None
 
 
-INPUT_FEATURES_FILE = "processed_features.csv"
-INPUT_FEATURES_PARQUET = "processed_features.parquet"
-ACTIVE_MODEL_FILE = "active_model.json"
-BENCHMARK_CONFIG_FILE = "configs/model_benchmark.json"
+PATHS = get_paths()
+REPO_ROOT = PATHS["repo_root"]
+DATA_DIR = PATHS["data_dir"]
+ARTIFACTS_DIR = PATHS["artifacts_dir"]
+
+INPUT_FEATURES_FILE = DATA_DIR / "processed_features.csv"
+INPUT_FEATURES_PARQUET = DATA_DIR / "processed_features.parquet"
+ACTIVE_MODEL_FILE = REPO_ROOT / "active_model.json"
+BENCHMARK_CONFIG_FILE = REPO_ROOT / "configs" / "model_benchmark.json"
+DEFAULT_OUTPUT_DIR = ARTIFACTS_DIR / "models"
 
 TRAIN_START_YEAR = 2018
 TRAIN_END_YEAR = 2023
@@ -297,7 +306,7 @@ def extract_importance(model_family, X_train, y_train, feature_cols, seed, param
 
 
 def load_features_frame():
-    if os.path.exists(INPUT_FEATURES_PARQUET):
+    if INPUT_FEATURES_PARQUET.exists():
         try:
             print(f"[INFO] Loading parquet: {INPUT_FEATURES_PARQUET}")
             return pd.read_parquet(INPUT_FEATURES_PARQUET)
@@ -430,7 +439,7 @@ def train_once(model_family, calibration, seed, output_dir, set_active=True, dat
         "run_id": run_id,
         "model_family": model_family,
         "calibration_method": calibration,
-        "input_file": INPUT_FEATURES_PARQUET if os.path.exists(INPUT_FEATURES_PARQUET) else INPUT_FEATURES_FILE,
+        "input_file": str(INPUT_FEATURES_PARQUET if INPUT_FEATURES_PARQUET.exists() else INPUT_FEATURES_FILE),
         "train_rows_original": int(len(ds["train_df"])),
         "train_rows_augmented": int(len(ds["train_aug"])),
         "test_rows": int(len(ds["test_df"])),
@@ -519,9 +528,9 @@ def suggest_params(model_family, trial):
 def run_backtest_if_requested(run_backtest_top):
     if not run_backtest_top:
         return {"enabled": False}
-    cmd = ["python", "backtest.py"]
+    cmd = [sys.executable, str(REPO_ROOT / "backtest.py")]
     print(f"[INFO] Running backtest for active model: {' '.join(cmd)}")
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT))
     return {
         "enabled": True,
         "returncode": int(proc.returncode),
@@ -531,9 +540,10 @@ def run_backtest_if_requested(run_backtest_top):
 
 
 def run_benchmark(args):
-    if not os.path.exists(args.benchmark_config):
-        raise FileNotFoundError(f"Benchmark config non trovato: {args.benchmark_config}")
-    with open(args.benchmark_config, "r", encoding="utf-8") as f:
+    benchmark_cfg_path = resolve_repo_path(args.benchmark_config, REPO_ROOT)
+    if not benchmark_cfg_path.exists():
+        raise FileNotFoundError(f"Benchmark config non trovato: {benchmark_cfg_path}")
+    with open(benchmark_cfg_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
     dataset_cache = prepare_dataset_cache()
@@ -638,7 +648,7 @@ def run_benchmark(args):
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "calibration": args.calibration,
         "seed": int(args.seed),
-        "benchmark_config": args.benchmark_config,
+        "benchmark_config": str(benchmark_cfg_path),
         "score_formula": "-logloss + 0.30*auc - 0.20*ece - 0.10*mce",
         "rows": bench_df.to_dict(orient="records"),
         "top_k_per_family": top_k,
@@ -679,10 +689,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Tennis model training and benchmarking.")
     parser.add_argument("--model-family", choices=["xgb", "lgbm", "catboost", "logreg"], default="xgb")
     parser.add_argument("--calibration", choices=["sigmoid", "isotonic", "none"], default="sigmoid")
-    parser.add_argument("--output-dir", default="artifacts/models")
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--benchmark", action="store_true", help="Run multi-family benchmark using config.")
-    parser.add_argument("--benchmark-config", default=BENCHMARK_CONFIG_FILE)
+    parser.add_argument("--benchmark-config", default=str(BENCHMARK_CONFIG_FILE))
     parser.add_argument("--set-active", dest="set_active", action="store_true", default=True)
     parser.add_argument("--no-set-active", dest="set_active", action="store_false")
     parser.add_argument("--run-backtest-top", action="store_true", help="Run backtest.py on selected active benchmark model.")
@@ -693,7 +703,15 @@ def main():
     print("============================================================")
     print("TRAIN V13 - MULTI-MODEL + CALIBRATION + REGISTRY")
     print("============================================================")
+
+    migration = ensure_data_layout()
+    moved = migration.get("moved", [])
+    renamed = migration.get("renamed_dup", [])
+    if moved or renamed:
+        print(f"[DATA_LAYOUT] moved={len(moved)} renamed_dup={len(renamed)}")
+
     args = parse_args()
+    args.output_dir = str(resolve_repo_path(args.output_dir, REPO_ROOT))
 
     if args.benchmark:
         run_benchmark(args)

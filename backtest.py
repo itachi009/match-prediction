@@ -12,6 +12,8 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
+from paths import ensure_data_layout, get_paths, resolve_repo_path
+
 try:
     from utils import DataNormalizer, standardize_dates
 except ImportError:
@@ -20,23 +22,28 @@ except ImportError:
 
 
 # --- FILE CONFIG ---
-FEATURES_FILE = "processed_features.csv"
-METADATA_FILE = "clean_matches.csv"
-ODDS_FILE_LOCAL = "2024_test.csv"
-ACTIVE_MODEL_FILE = "active_model.json"
-MODEL_FILE_DEFAULT = "model_v9_balanced.pkl"
-MODEL_FEATURES_FILE_DEFAULT = "model_features.pkl"
-PLOT_FILE = "real_backtest.png"
-BASELINE_CONFIG_FILE = "backtest_baseline_config.json"
-VALIDATION_REPORT_FILE = "backtest_validation_report.json"
-WALKFORWARD_REPORT_FILE = "backtest_walkforward_report.json"
-STRESS_REPORT_FILE = "backtest_stress_report.json"
-RELIABILITY_PLOT_FILE = "reliability_curve.png"
-RELIABILITY_TABLE_FILE = "reliability_table.csv"
-BACKTEST_TUNING_CONFIG_FILE = "configs/backtest_tuning.json"
-RUNS_DIR = "runs"
-SCORECARD_HISTORY_FILE = os.path.join(RUNS_DIR, "scorecard_history.csv")
-LIVE_BETS_LOG_FILE = os.path.join(RUNS_DIR, "live_bets_log.csv")
+PATHS = get_paths()
+REPO_ROOT = PATHS["repo_root"]
+DATA_DIR = PATHS["data_dir"]
+ARTIFACTS_DIR = PATHS["artifacts_dir"]
+RUNS_DIR = PATHS["runs_dir"]
+
+FEATURES_FILE = DATA_DIR / "processed_features.csv"
+METADATA_FILE = DATA_DIR / "clean_matches.csv"
+ODDS_FILE_LOCAL = DATA_DIR / "2024_test.csv"
+ACTIVE_MODEL_FILE = REPO_ROOT / "active_model.json"
+MODEL_FILE_DEFAULT = REPO_ROOT / "model_v9_balanced.pkl"
+MODEL_FEATURES_FILE_DEFAULT = REPO_ROOT / "model_features.pkl"
+PLOT_FILE = RUNS_DIR / "real_backtest.png"
+BASELINE_CONFIG_FILE = RUNS_DIR / "backtest_baseline_config.json"
+VALIDATION_REPORT_FILE = RUNS_DIR / "backtest_validation_report.json"
+WALKFORWARD_REPORT_FILE = RUNS_DIR / "backtest_walkforward_report.json"
+STRESS_REPORT_FILE = RUNS_DIR / "backtest_stress_report.json"
+RELIABILITY_PLOT_FILE = RUNS_DIR / "reliability_curve.png"
+RELIABILITY_TABLE_FILE = RUNS_DIR / "reliability_table.csv"
+BACKTEST_TUNING_CONFIG_FILE = REPO_ROOT / "configs" / "backtest_tuning.json"
+SCORECARD_HISTORY_FILE = RUNS_DIR / "scorecard_history.csv"
+LIVE_BETS_LOG_FILE = RUNS_DIR / "live_bets_log.csv"
 SCORECARD_COLUMNS = [
     "timestamp_utc",
     "backtest_run_id",
@@ -181,8 +188,8 @@ def resolve_active_model_registry(path=ACTIVE_MODEL_FILE):
     default_payload = {
         "run_id": "default_backtest_fallback",
         "model_family": "xgb",
-        "model_path": MODEL_FILE_DEFAULT,
-        "features_path": MODEL_FEATURES_FILE_DEFAULT,
+        "model_path": str(MODEL_FILE_DEFAULT),
+        "features_path": str(MODEL_FEATURES_FILE_DEFAULT),
         "metadata_path": None,
     }
     if not os.path.exists(path):
@@ -200,8 +207,8 @@ def resolve_active_model_registry(path=ACTIVE_MODEL_FILE):
 
 
 ACTIVE_MODEL = resolve_active_model_registry()
-MODEL_FILE = ACTIVE_MODEL.get("model_path", MODEL_FILE_DEFAULT)
-MODEL_FEATURES_FILE = ACTIVE_MODEL.get("features_path", MODEL_FEATURES_FILE_DEFAULT)
+MODEL_FILE = resolve_repo_path(ACTIVE_MODEL.get("model_path", str(MODEL_FILE_DEFAULT)), REPO_ROOT)
+MODEL_FEATURES_FILE = resolve_repo_path(ACTIVE_MODEL.get("features_path", str(MODEL_FEATURES_FILE_DEFAULT)), REPO_ROOT)
 
 
 # --- STRATEGY BASELINE (POINT 1: FROZEN BASELINE) ---
@@ -307,21 +314,21 @@ def add_report_metadata(payload, run_context=None):
 
 
 def ensure_runs_artifacts():
-    os.makedirs(RUNS_DIR, exist_ok=True)
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
     created_files = []
 
-    if not os.path.exists(SCORECARD_HISTORY_FILE):
+    if not SCORECARD_HISTORY_FILE.exists():
         pd.DataFrame(columns=SCORECARD_COLUMNS).to_csv(SCORECARD_HISTORY_FILE, index=False)
-        created_files.append(SCORECARD_HISTORY_FILE)
+        created_files.append(str(SCORECARD_HISTORY_FILE))
 
-    if not os.path.exists(LIVE_BETS_LOG_FILE):
+    if not LIVE_BETS_LOG_FILE.exists():
         pd.DataFrame(columns=LIVE_BETS_COLUMNS).to_csv(LIVE_BETS_LOG_FILE, index=False)
-        created_files.append(LIVE_BETS_LOG_FILE)
+        created_files.append(str(LIVE_BETS_LOG_FILE))
 
     return {
-        "runs_dir": RUNS_DIR,
-        "scorecard_history_file": SCORECARD_HISTORY_FILE,
-        "live_bets_log_file": LIVE_BETS_LOG_FILE,
+        "runs_dir": str(RUNS_DIR),
+        "scorecard_history_file": str(SCORECARD_HISTORY_FILE),
+        "live_bets_log_file": str(LIVE_BETS_LOG_FILE),
         "created_files": created_files,
     }
 
@@ -430,7 +437,7 @@ def append_scorecard_history(consolidated, run_context):
         "promotion_reasons": "|".join(promo.get("reasons", [])),
     }
     row_df = pd.DataFrame([{col: row.get(col) for col in SCORECARD_COLUMNS}])
-    header = not os.path.exists(SCORECARD_HISTORY_FILE) or os.path.getsize(SCORECARD_HISTORY_FILE) == 0
+    header = (not SCORECARD_HISTORY_FILE.exists()) or SCORECARD_HISTORY_FILE.stat().st_size == 0
     row_df.to_csv(SCORECARD_HISTORY_FILE, mode="a", header=header, index=False)
     return row
 
@@ -447,12 +454,12 @@ def render_progress_bar(current, total, width=30):
 def freeze_baseline_config(config, run_context=None, path=BASELINE_CONFIG_FILE):
     payload = {
         "frozen_at": pd.Timestamp.utcnow().isoformat(),
-        "model_file": MODEL_FILE,
-        "model_features_file": MODEL_FEATURES_FILE,
-        "active_model_file": ACTIVE_MODEL_FILE,
+        "model_file": str(MODEL_FILE),
+        "model_features_file": str(MODEL_FEATURES_FILE),
+        "active_model_file": str(ACTIVE_MODEL_FILE),
         "active_model": ACTIVE_MODEL,
-        "features_file": FEATURES_FILE,
-        "odds_file": ODDS_FILE_LOCAL,
+        "features_file": str(FEATURES_FILE),
+        "odds_file": str(ODDS_FILE_LOCAL),
         "tuning_runtime": BACKTEST_TUNING_RUNTIME,
         "config": config,
     }
@@ -1001,7 +1008,7 @@ def build_no_odds_eval_report(df_feats, baseline_config):
 
     return {
         "enabled": True,
-        "source": FEATURES_FILE,
+        "source": str(FEATURES_FILE),
         "year": eval_year,
         "levels": levels,
         "combined": combined,
@@ -2360,6 +2367,13 @@ def run_backtest_v7():
         f"lambda_bets={LAMBDA_BETS} | guardrail_max_bets_inc={MAX_BETS_INCREASE_PCT:.2f} | "
         f"restricted_mode={RESTRICTED_TUNING_MODE} | fold_freq={FOLD_FREQ}"
     )
+
+    migration = ensure_data_layout()
+    moved = migration.get("moved", [])
+    renamed = migration.get("renamed_dup", [])
+    if moved or renamed:
+        print(f"[DATA_LAYOUT] moved={len(moved)} renamed_dup={len(renamed)}")
+
     run_context = build_backtest_run_context()
     print(
         f"[RUN] backtest_run_id={run_context['run_id']} | "
@@ -2406,7 +2420,7 @@ def run_backtest_v7():
             print(f"    [WARN] no_odds_eval non disponibile: {e}")
             no_odds_report = {
                 "enabled": True,
-                "source": FEATURES_FILE,
+                "source": str(FEATURES_FILE),
                 "year": int(BASELINE_CONFIG.get('no_odds_eval_year', 2024)),
                 "levels": BASELINE_CONFIG.get("no_odds_eval_levels", ["C", "F"]),
                 "error": str(e),
@@ -2501,10 +2515,10 @@ def run_backtest_v7():
         "backtest_generated_at_utc": run_context["generated_at_utc"],
         "active_model_run_id": run_context["active_model_run_id"],
         "report_files": {
-            "validation": VALIDATION_REPORT_FILE,
-            "walkforward": WALKFORWARD_REPORT_FILE,
-            "stress": STRESS_REPORT_FILE,
-            "baseline_config": BASELINE_CONFIG_FILE,
+            "validation": str(VALIDATION_REPORT_FILE),
+            "walkforward": str(WALKFORWARD_REPORT_FILE),
+            "stress": str(STRESS_REPORT_FILE),
+            "baseline_config": str(BASELINE_CONFIG_FILE),
         },
         "runs_artifacts": runs_artifacts,
         "baseline_config": BASELINE_CONFIG,
