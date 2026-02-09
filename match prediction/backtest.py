@@ -13,6 +13,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
 from paths import ensure_data_layout, get_paths, resolve_repo_path
+from policy_layer import apply_policy_layer, load_policy_layer_config
 from reporting.buckets import make_bucket_report, make_probability_bucket_edges, summarize_bucket_extremes
 
 try:
@@ -46,6 +47,7 @@ RELIABILITY_BY_P_BUCKET_FILE = RUNS_DIR / "reliability_by_p_bucket.csv"
 RELIABILITY_BY_UNCERTAINTY_BUCKET_FILE = RUNS_DIR / "reliability_by_uncertainty_bucket.csv"
 RELIABILITY_BY_ODDS_BUCKET_FILE = RUNS_DIR / "reliability_by_odds_bucket.csv"
 BACKTEST_TUNING_CONFIG_FILE = REPO_ROOT / "configs" / "backtest_tuning.json"
+POLICY_LAYER_CONFIG_FILE = REPO_ROOT / "configs" / "policy_layer.json"
 SCORECARD_HISTORY_FILE = RUNS_DIR / "scorecard_history.csv"
 LIVE_BETS_LOG_FILE = RUNS_DIR / "live_bets_log.csv"
 CALIBRATION_DIR = ARTIFACTS_DIR / "calibration"
@@ -314,6 +316,7 @@ MP_N_MIN_CALIB = max(50, _as_int(os.getenv("MP_N_MIN_CALIB"), 500))
 MP_UNCERTAINTY_WEIGHTS = parse_uncertainty_weights(os.getenv("MP_UNCERTAINTY_WEIGHTS"))
 MP_BUCKET_STEP = float(np.clip(_as_float(os.getenv("MP_BUCKET_STEP"), 0.05), 0.01, 0.20))
 MP_ENABLE_BUCKET_REPORTS = _as_bool(os.getenv("MP_ENABLE_BUCKET_REPORTS"), True)
+POLICY_LAYER_CONFIG = load_policy_layer_config(POLICY_LAYER_CONFIG_FILE)
 
 STRESS_SCENARIOS = [
     {"name": "baseline", "payout_haircut_pct": 0.00, "commission_pct": 0.00, "slippage_pct": 0.00},
@@ -1458,6 +1461,7 @@ def simulate_strategy(
     compute_bootstrap=True,
     calibrator=None,
     level_calibrators=None,
+    policy_cfg=None,
     fixed_selection=None,
     fixed_sizing_no_cost=False,
 ):
@@ -1467,6 +1471,7 @@ def simulate_strategy(
     cfg.setdefault("slippage_pct", 0.0)
     cfg.setdefault("residual_shrink_odds_2_5", 1.0)
     cfg.setdefault("residual_shrink_odds_3_0", 1.0)
+    policy_cfg = dict(POLICY_LAYER_CONFIG if policy_cfg is None else policy_cfg)
 
     if df_sim.empty:
         return {
@@ -1485,6 +1490,14 @@ def simulate_strategy(
             "skip": {},
             "selected_decisions": {},
             "bet_records": [],
+            "policy": {
+                "enabled": bool(policy_cfg.get("enabled", True)),
+                "blocked_total": 0,
+                "blocked_rate": 0.0,
+                "blocked_counts_by_reason": {},
+                "evaluated_candidates": 0,
+            },
+            "policy_audit": [],
         }
 
     skip = {
@@ -1497,7 +1510,10 @@ def simulate_strategy(
         "low_signal": 0,
         "rank_cap": 0,
         "high_uncertainty": 0,
+        "policy_blocked": 0,
     }
+    policy_blocked_counts = {}
+    policy_audit_rows = []
 
     if fixed_selection is None:
         decisions = {}
@@ -1522,9 +1538,6 @@ def simulate_strategy(
             fair_p1 = implied_p1 / overround
             uncertainty_score = clip01(getattr(row, "uncertainty_score", 0.0))
             recommendation_allowed = bool(getattr(row, "recommendation_allowed", True))
-            if (not recommendation_allowed) or uncertainty_score > float(MP_MAX_UNCERTAINTY_FOR_RECO):
-                skip["high_uncertainty"] += 1
-                continue
 
             _, p_cal, p_model_raw = apply_probability_pipeline(
                 row.prob_p1_win,
@@ -1535,6 +1548,43 @@ def simulate_strategy(
                 level_calibrators=level_calibrators,
             )
             p_model = float(apply_uncertainty_to_confidence([p_model_raw], [uncertainty_score])[0])
+            level_val = _normalize_level_scalar(getattr(row, "level", None))
+            policy_input = pd.DataFrame(
+                [
+                    {
+                        "p_calibrated": float(p_cal),
+                        "confidence": float(p_model),
+                        "uncertainty_score": float(uncertainty_score),
+                        "odds": float(odd_p1_raw),
+                        "level": level_val,
+                        "recommendation_allowed": bool(recommendation_allowed),
+                    }
+                ]
+            )
+            policy_out = apply_policy_layer(policy_input, policy_cfg)
+            policy_allowed = bool(policy_out["policy_allowed"].iloc[0])
+            policy_reason = str(policy_out["policy_reason"].iloc[0])
+            p_model = float(np.clip(policy_out["effective_confidence"].iloc[0], 0.0, 1.0))
+            policy_audit_rows.append(
+                {
+                    "odds_row_id": row_id,
+                    "p_calibrated": float(p_cal),
+                    "confidence_before_policy": float(apply_uncertainty_to_confidence([p_model_raw], [uncertainty_score])[0]),
+                    "effective_confidence": float(p_model),
+                    "uncertainty_score": float(uncertainty_score),
+                    "odds": float(odd_p1_raw),
+                    "level": level_val,
+                    "policy_allowed": bool(policy_allowed),
+                    "policy_reason": policy_reason,
+                }
+            )
+            if not policy_allowed:
+                skip["policy_blocked"] += 1
+                if policy_reason == "skip:high_uncertainty":
+                    skip["high_uncertainty"] += 1
+                policy_blocked_counts[policy_reason] = int(policy_blocked_counts.get(policy_reason, 0)) + 1
+                continue
+
             if p_model < float(cfg["min_confidence"]):
                 skip["low_conf"] += 1
                 continue
@@ -1575,8 +1625,10 @@ def simulate_strategy(
                 "p1_is_real_winner": bool(row.p1_is_real_winner),
                 "uncertainty_score": uncertainty_score,
                 "recommendation_allowed": recommendation_allowed,
+                "policy_allowed": bool(policy_allowed),
+                "policy_reason": policy_reason,
                 "effective_confidence": p_model,
-                "level": _normalize_level_scalar(getattr(row, "level", None)),
+                "level": level_val,
             }
             prev = decisions.get(row_id)
             if prev is None or decision["signal"] > prev["signal"]:
@@ -1650,6 +1702,8 @@ def simulate_strategy(
                     "pnl": float(pnl),
                     "effective_confidence": float(decision.get("effective_confidence", p_sel)),
                     "uncertainty_score": float(decision.get("uncertainty_score", 0.0)),
+                    "policy_allowed": bool(decision.get("policy_allowed", True)),
+                    "policy_reason": str(decision.get("policy_reason", "allow:ok")),
                 }
             )
 
@@ -1676,6 +1730,9 @@ def simulate_strategy(
 
     equity_df = pd.DataFrame(equity_rows)
     monthly_df = compute_monthly_roi(equity_df, initial_bankroll)
+    policy_evaluated = int(len(policy_audit_rows))
+    policy_blocked_total = int(sum(int(v) for v in policy_blocked_counts.values()))
+    policy_blocked_rate = (float(policy_blocked_total) / float(policy_evaluated)) if policy_evaluated > 0 else 0.0
 
     return {
         "bankroll": float(bankroll),
@@ -1693,6 +1750,14 @@ def simulate_strategy(
         "skip": skip,
         "selected_decisions": selected,
         "bet_records": bet_records,
+        "policy": {
+            "enabled": bool(policy_cfg.get("enabled", True)),
+            "blocked_total": policy_blocked_total,
+            "blocked_rate": float(policy_blocked_rate),
+            "blocked_counts_by_reason": policy_blocked_counts,
+            "evaluated_candidates": policy_evaluated,
+        },
+        "policy_audit": policy_audit_rows,
     }
 
 
@@ -1716,8 +1781,20 @@ def print_strategy_report(result):
     print(
         f"Skip odds range: {s.get('odds_range', 0)} | Skip dyn-edge: {s.get('dyn_edge', 0)} | "
         f"Skip low Kelly: {s.get('low_kelly', 0)} | Skip low signal: {s.get('low_signal', 0)} | "
-        f"Skip rank cap: {s.get('rank_cap', 0)} | Skip high uncertainty: {s.get('high_uncertainty', 0)}"
+        f"Skip rank cap: {s.get('rank_cap', 0)} | Skip high uncertainty: {s.get('high_uncertainty', 0)} | "
+        f"Skip policy blocked: {s.get('policy_blocked', 0)}"
     )
+    policy = result.get("policy", {})
+    if policy:
+        print(
+            f"Policy layer enabled: {policy.get('enabled')} | "
+            f"evaluated: {policy.get('evaluated_candidates', 0)} | "
+            f"blocked: {policy.get('blocked_total', 0)} "
+            f"({float(policy.get('blocked_rate', 0.0)) * 100:.2f}%)"
+        )
+        blocked_by_reason = policy.get("blocked_counts_by_reason") or {}
+        if blocked_by_reason:
+            print(f"Policy blocked by reason: {blocked_by_reason}")
 
     # Point 2: robustness block
     ci_low, ci_high = result["bootstrap_roi_ci"]
@@ -2193,7 +2270,64 @@ def build_bucket_reports(
         right=False,
     )
 
+    policy_audit_df = pd.DataFrame((baseline_result or {}).get("policy_audit", []))
+    if not policy_audit_df.empty:
+        policy_audit_df["p_bucket"] = pd.cut(
+            pd.to_numeric(policy_audit_df.get("p_calibrated"), errors="coerce"),
+            bins=p_edges,
+            include_lowest=True,
+            right=False,
+        )
+        policy_audit_df["odds_bucket"] = pd.cut(
+            pd.to_numeric(policy_audit_df.get("odds"), errors="coerce"),
+            bins=np.array([1.4, 1.7, 2.1, 2.7, 100.0], dtype=float),
+            include_lowest=True,
+            right=False,
+        )
+
+    def attach_policy_counts(report_df, bucket_col):
+        out = report_df.copy()
+        out["n_candidates_before_policy"] = 0
+        out["n_allowed_after_policy"] = 0
+        out["allowed_rate"] = np.nan
+        if policy_audit_df.empty:
+            return out
+        tmp = policy_audit_df.copy()
+        tmp[bucket_col] = tmp[bucket_col].astype(str)
+        grouped = (
+            tmp.groupby(bucket_col, observed=False)
+            .agg(
+                n_candidates_before_policy=("policy_allowed", "size"),
+                n_allowed_after_policy=("policy_allowed", "sum"),
+            )
+            .reset_index()
+        )
+        grouped["allowed_rate"] = grouped["n_allowed_after_policy"] / grouped["n_candidates_before_policy"].where(
+            grouped["n_candidates_before_policy"] > 0, np.nan
+        )
+        out = out.merge(grouped, on=bucket_col, how="left", suffixes=("", "_policy"))
+        for c in ["n_candidates_before_policy", "n_allowed_after_policy"]:
+            out[c] = (
+                pd.to_numeric(out[c], errors="coerce")
+                .fillna(pd.to_numeric(out.get(f"{c}_policy"), errors="coerce"))
+                .fillna(0)
+                .astype(int)
+            )
+        out["allowed_rate"] = pd.to_numeric(out["allowed_rate"], errors="coerce").fillna(
+            pd.to_numeric(out.get("allowed_rate_policy"), errors="coerce")
+        )
+        drop_cols = [
+            "n_candidates_before_policy_policy",
+            "n_allowed_after_policy_policy",
+            "allowed_rate_policy",
+        ]
+        drop_cols = [c for c in drop_cols if c in out.columns]
+        if drop_cols:
+            out = out.drop(columns=drop_cols)
+        return out
+
     p_report = make_bucket_report(work, "p_bucket", "p_calibrated", "y")
+    p_report = attach_policy_counts(p_report, "p_bucket")
     p_report.to_csv(RELIABILITY_BY_P_BUCKET_FILE, index=False)
 
     uncertainty_report = make_bucket_report(work, "uncertainty_bucket", "p_calibrated", "y")
@@ -2208,6 +2342,7 @@ def build_bucket_reports(
         stake_col="stake",
         pnl_col="pnl",
     )
+    odds_report = attach_policy_counts(odds_report, "odds_bucket")
     odds_report.to_csv(RELIABILITY_BY_ODDS_BUCKET_FILE, index=False)
 
     p_gap_extremes = summarize_bucket_extremes(p_report, "calibration_gap", n=3, prefer_small_abs=True)
@@ -2230,6 +2365,14 @@ def build_bucket_reports(
             "p_bucket": str(RELIABILITY_BY_P_BUCKET_FILE),
             "uncertainty_bucket": str(RELIABILITY_BY_UNCERTAINTY_BUCKET_FILE),
             "odds_bucket": str(RELIABILITY_BY_ODDS_BUCKET_FILE),
+        },
+        "after_policy_summary": {
+            "n_candidates_before_policy": int(len(policy_audit_df)),
+            "n_allowed_after_policy": int(
+                pd.to_numeric(policy_audit_df.get("policy_allowed"), errors="coerce").fillna(0).astype(bool).sum()
+            )
+            if not policy_audit_df.empty
+            else 0,
         },
         "extremes": {
             "p_bucket_calibration_gap": p_gap_extremes,
@@ -2866,6 +3009,12 @@ def run_backtest_v7():
         f"weights={MP_UNCERTAINTY_WEIGHTS} | n_min_calib={MP_N_MIN_CALIB} | "
         f"bucket_step={MP_BUCKET_STEP:.2f} | bucket_reports={MP_ENABLE_BUCKET_REPORTS}"
     )
+    print(
+        f"[POLICY] enabled={POLICY_LAYER_CONFIG.get('enabled')} | "
+        f"skip_odds_1_7_2_1={POLICY_LAYER_CONFIG.get('skip_odds_bucket_17_21')} | "
+        f"max_unc_bet={POLICY_LAYER_CONFIG.get('max_uncertainty_for_bet')} | "
+        f"soft_mode={POLICY_LAYER_CONFIG.get('policy_soft_mode')}"
+    )
 
     migration = ensure_data_layout()
     moved = migration.get("moved", [])
@@ -3052,6 +3201,10 @@ def run_backtest_v7():
         "baseline_config": BASELINE_CONFIG,
         "baseline_config_snapshot": baseline_snapshot,
         "tuning_runtime": BACKTEST_TUNING_RUNTIME,
+        "policy_layer_enabled": bool(POLICY_LAYER_CONFIG.get("enabled", True)),
+        "policy_layer_config": POLICY_LAYER_CONFIG,
+        "blocked_counts_by_reason": ((baseline_result.get("policy") or {}).get("blocked_counts_by_reason") or {}),
+        "blocked_rate": (baseline_result.get("policy") or {}).get("blocked_rate"),
         "uncertainty_config": {
             "max_uncertainty_for_reco": float(MP_MAX_UNCERTAINTY_FOR_RECO),
             "weights": MP_UNCERTAINTY_WEIGHTS,
@@ -3069,6 +3222,7 @@ def run_backtest_v7():
             "profit_factor": baseline_result["profit_factor"],
             "bootstrap_roi_ci": baseline_result["bootstrap_roi_ci"],
             "skip": baseline_result.get("skip", {}),
+            "policy": baseline_result.get("policy", {}),
         },
         "calibration": {
             "brier_raw": calibration_report["brier_raw"],

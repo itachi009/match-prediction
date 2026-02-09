@@ -289,6 +289,36 @@ python -c "import json; r=json.load(open('runs/backtest_validation_report.json')
 BT_FOLD_FREQ=halfyear python backtest.py
 ```
 
+## Policy Layer (Post-Processing Betting)
+
+Layer leggero applicato **prima** della decisione finale di bet/recommend.
+Non modifica il training ML, ma filtra o penalizza confidenze fragili in base a:
+- `uncertainty_score` (gate hard),
+- bucket odds (guardrail su `1.7-2.1`),
+- bucket probabilita (`[0.70,0.75)` prudente).
+
+Config default in `configs/policy_layer.json`.
+
+Override principali via env:
+- `MP_POLICY_ENABLED` (`true|false`)
+- `MP_POLICY_MAX_UNCERTAINTY_FOR_BET`
+- `MP_POLICY_SKIP_ODDS_BUCKET_17_21`
+- `MP_POLICY_MAX_UNCERTAINTY_FOR_17_21`
+- `MP_POLICY_MIN_CONFIDENCE_FOR_17_21`
+- `MP_POLICY_MAX_UNCERTAINTY_FOR_P_70_75`
+- `MP_POLICY_SOFT_MODE`
+- `MP_POLICY_P_BUCKET_PENALTY`
+
+Disabilitare il policy layer:
+```bash
+MP_POLICY_ENABLED=false python backtest.py
+```
+
+Smoke test dedicato:
+```bash
+python scripts/smoke_policy_layer.py
+```
+
 Coerenza report run:
 - ogni esecuzione di `python backtest.py` genera `backtest_run_id` e `backtest_generated_at_utc` condivisi in:
   - `runs/backtest_validation_report.json`
