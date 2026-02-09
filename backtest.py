@@ -13,6 +13,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
 from paths import ensure_data_layout, get_paths, resolve_repo_path
+from reporting.buckets import make_bucket_report, make_probability_bucket_edges, summarize_bucket_extremes
 
 try:
     from utils import DataNormalizer, standardize_dates
@@ -41,9 +42,13 @@ WALKFORWARD_REPORT_FILE = RUNS_DIR / "backtest_walkforward_report.json"
 STRESS_REPORT_FILE = RUNS_DIR / "backtest_stress_report.json"
 RELIABILITY_PLOT_FILE = RUNS_DIR / "reliability_curve.png"
 RELIABILITY_TABLE_FILE = RUNS_DIR / "reliability_table.csv"
+RELIABILITY_BY_P_BUCKET_FILE = RUNS_DIR / "reliability_by_p_bucket.csv"
+RELIABILITY_BY_UNCERTAINTY_BUCKET_FILE = RUNS_DIR / "reliability_by_uncertainty_bucket.csv"
+RELIABILITY_BY_ODDS_BUCKET_FILE = RUNS_DIR / "reliability_by_odds_bucket.csv"
 BACKTEST_TUNING_CONFIG_FILE = REPO_ROOT / "configs" / "backtest_tuning.json"
 SCORECARD_HISTORY_FILE = RUNS_DIR / "scorecard_history.csv"
 LIVE_BETS_LOG_FILE = RUNS_DIR / "live_bets_log.csv"
+CALIBRATION_DIR = ARTIFACTS_DIR / "calibration"
 SCORECARD_COLUMNS = [
     "timestamp_utc",
     "backtest_run_id",
@@ -130,6 +135,31 @@ def _as_float_list(value, default_list):
                 continue
         return out if out else [float(v) for v in default_list]
     return [float(v) for v in default_list]
+
+
+def clip01(value):
+    return float(np.clip(float(value), 0.0, 1.0))
+
+
+def parse_uncertainty_weights(raw_value):
+    defaults = {"w1": 0.25, "w2": 0.25, "w3": 0.20, "w4": 0.20, "w5": 0.10}
+    if raw_value is None:
+        return defaults
+
+    out = dict(defaults)
+    chunks = [x.strip() for x in str(raw_value).split(",") if x.strip()]
+    for chunk in chunks:
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        key = key.strip().lower()
+        if key not in out:
+            continue
+        try:
+            out[key] = max(0.0, float(value))
+        except Exception:
+            continue
+    return out
 
 
 def load_backtest_tuning_runtime(path=BACKTEST_TUNING_CONFIG_FILE):
@@ -279,6 +309,11 @@ RESTRICTED_FIXED_PROB_SHRINK = float(BACKTEST_TUNING_RUNTIME["restricted_fixed_p
 RESTRICTED_MIN_EDGE_VALUES = [float(v) for v in BACKTEST_TUNING_RUNTIME["restricted_min_edge_values"]]
 RESTRICTED_MIN_CONFIDENCE_VALUES = [float(v) for v in BACKTEST_TUNING_RUNTIME["restricted_min_confidence_values"]]
 FOLD_FREQ = str(BACKTEST_TUNING_RUNTIME["fold_freq"])
+MP_MAX_UNCERTAINTY_FOR_RECO = clip01(_as_float(os.getenv("MP_MAX_UNCERTAINTY_FOR_RECO"), 0.55))
+MP_N_MIN_CALIB = max(50, _as_int(os.getenv("MP_N_MIN_CALIB"), 500))
+MP_UNCERTAINTY_WEIGHTS = parse_uncertainty_weights(os.getenv("MP_UNCERTAINTY_WEIGHTS"))
+MP_BUCKET_STEP = float(np.clip(_as_float(os.getenv("MP_BUCKET_STEP"), 0.05), 0.01, 0.20))
+MP_ENABLE_BUCKET_REPORTS = _as_bool(os.getenv("MP_ENABLE_BUCKET_REPORTS"), True)
 
 STRESS_SCENARIOS = [
     {"name": "baseline", "payout_haircut_pct": 0.00, "commission_pct": 0.00, "slippage_pct": 0.00},
@@ -465,7 +500,7 @@ def freeze_baseline_config(config, run_context=None, path=BASELINE_CONFIG_FILE):
     }
     payload = add_report_metadata(payload, run_context)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(payload, f, indent=2, default=str)
     print(f"    Baseline config salvata in: {path}")
     return payload
 
@@ -552,6 +587,14 @@ def load_features_and_predictions():
 
     X = df_feats[model_features].fillna(0)
     df_feats["prob_p1_win"] = model.predict_proba(X.values)[:, 1]
+    df_feats["level"] = infer_match_levels(df_feats).fillna("A")
+    uncertainty = compute_uncertainty_components(df_feats)
+    for col in uncertainty.columns:
+        df_feats[col] = uncertainty[col]
+    df_feats["effective_confidence"] = apply_uncertainty_to_confidence(
+        df_feats["prob_p1_win"].to_numpy(dtype=float),
+        df_feats["uncertainty_score"].to_numpy(dtype=float),
+    )
     return df_feats
 
 
@@ -597,7 +640,27 @@ def build_oriented_merged_dataset(df_feats, df_odds):
         df_feats["surface_key"] = "UNK"
         use_surface_merge = False
 
-    feats_merge = df_feats[["tourney_date", "directed_id", "surface_key", "prob_p1_win"]].copy()
+    for col, default in [
+        ("level", "A"),
+        ("uncertainty_score", 0.0),
+        ("recommendation_allowed", True),
+        ("effective_confidence", np.nan),
+    ]:
+        if col not in df_feats.columns:
+            df_feats[col] = default
+
+    feats_merge = df_feats[
+        [
+            "tourney_date",
+            "directed_id",
+            "surface_key",
+            "prob_p1_win",
+            "level",
+            "uncertainty_score",
+            "recommendation_allowed",
+            "effective_confidence",
+        ]
+    ].copy()
     feats_merge = feats_merge.sort_values("tourney_date")
 
     df_odds = df_odds.copy()
@@ -825,6 +888,82 @@ def infer_match_years(df):
     return years
 
 
+def _normalize_level_scalar(level_value):
+    if level_value is None:
+        return None
+    s = str(level_value).strip().upper()
+    if not s:
+        return None
+    if s in {"A", "C", "F"}:
+        return s
+    if s.startswith("ATP"):
+        return "A"
+    if "CHALL" in s:
+        return "C"
+    if "FUT" in s or "ITF" in s:
+        return "F"
+    return s[0] if s[0] in {"A", "C", "F"} else None
+
+
+def compute_uncertainty_components(df):
+    work = df.copy()
+    n = len(work)
+    zeros = pd.Series(np.zeros(n, dtype=float), index=work.index)
+
+    p1_no_prev = pd.to_numeric(work.get("p1_no_prev_match", zeros), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    p2_no_prev = pd.to_numeric(work.get("p2_no_prev_match", zeros), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    u_no_prev_match = np.maximum(p1_no_prev, p2_no_prev)
+
+    p1_days = pd.to_numeric(work.get("p1_days_since_last_match", zeros), errors="coerce").fillna(30.0).clip(lower=0.0)
+    p2_days = pd.to_numeric(work.get("p2_days_since_last_match", zeros), errors="coerce").fillna(30.0).clip(lower=0.0)
+    p1_long_stop = ((p1_days - 30.0) / 120.0).clip(0.0, 1.0)
+    p2_long_stop = ((p2_days - 30.0) / 120.0).clip(0.0, 1.0)
+    u_long_stop = np.maximum(p1_long_stop, p2_long_stop)
+
+    p1_m30 = pd.to_numeric(work.get("p1_matches_last_30d", zeros), errors="coerce").fillna(0.0).clip(lower=0.0)
+    p2_m30 = pd.to_numeric(work.get("p2_matches_last_30d", zeros), errors="coerce").fillna(0.0).clip(lower=0.0)
+    p1_m180 = (p1_m30 * 6.0).clip(0.0, 30.0)
+    p2_m180 = (p2_m30 * 6.0).clip(0.0, 30.0)
+    p1_low_vol = ((10.0 - p1_m180) / 10.0).clip(0.0, 1.0)
+    p2_low_vol = ((10.0 - p2_m180) / 10.0).clip(0.0, 1.0)
+    u_low_recent_volume = np.maximum(p1_low_vol, p2_low_vol)
+
+    p1_surface_matches = pd.to_numeric(work.get("p1_surface_matches_last_180d", p1_m30), errors="coerce").fillna(0.0).clip(lower=0.0)
+    p2_surface_matches = pd.to_numeric(work.get("p2_surface_matches_last_180d", p2_m30), errors="coerce").fillna(0.0).clip(lower=0.0)
+    p1_surface_sparse = ((8.0 - p1_surface_matches) / 8.0).clip(0.0, 1.0)
+    p2_surface_sparse = ((8.0 - p2_surface_matches) / 8.0).clip(0.0, 1.0)
+    u_surface_sparsity = np.maximum(p1_surface_sparse, p2_surface_sparse)
+
+    p1_transition = pd.to_numeric(work.get("p1_new_level_transition", zeros), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    p2_transition = pd.to_numeric(work.get("p2_new_level_transition", zeros), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    u_new_level_transition = np.maximum(p1_transition, p2_transition)
+
+    w = MP_UNCERTAINTY_WEIGHTS
+    uncertainty = (
+        float(w["w1"]) * u_no_prev_match
+        + float(w["w2"]) * u_long_stop
+        + float(w["w3"]) * u_low_recent_volume
+        + float(w["w4"]) * u_surface_sparsity
+        + float(w["w5"]) * u_new_level_transition
+    ).clip(0.0, 1.0)
+
+    out = pd.DataFrame(index=work.index)
+    out["u_no_prev_match"] = u_no_prev_match
+    out["u_long_stop"] = u_long_stop
+    out["u_low_recent_volume"] = u_low_recent_volume
+    out["u_surface_sparsity"] = u_surface_sparsity
+    out["u_new_level_transition"] = u_new_level_transition
+    out["uncertainty_score"] = uncertainty
+    out["recommendation_allowed"] = uncertainty <= float(MP_MAX_UNCERTAINTY_FOR_RECO)
+    return out
+
+
+def apply_uncertainty_to_confidence(confidence, uncertainty_score):
+    conf = np.asarray(confidence, dtype=float)
+    unc = np.asarray(uncertainty_score, dtype=float).clip(0.0, 1.0)
+    return np.clip(conf * (1.0 - unc), 0.0, 1.0)
+
+
 def extract_binary_target(df):
     if "target" in df.columns:
         y = pd.to_numeric(df["target"], errors="coerce")
@@ -918,7 +1057,7 @@ def compute_no_odds_train_prior(eval_year, allowed_levels):
     return prior, n_rows
 
 
-def build_no_odds_eval_report(df_feats, baseline_config):
+def build_no_odds_eval_report(df_feats, baseline_config, level_calibration_bundle=None):
     eval_year = int(baseline_config.get("no_odds_eval_year", 2024))
     min_matches = int(baseline_config.get("no_odds_min_matches", 200))
     gate_policy = str(baseline_config.get("no_odds_gate_policy", "light"))
@@ -938,6 +1077,8 @@ def build_no_odds_eval_report(df_feats, baseline_config):
     match_levels = infer_match_levels(df)
     y = extract_binary_target(df)
     raw_prob = pd.to_numeric(df.get("prob_p1_win"), errors="coerce")
+    uncertainty_score = pd.to_numeric(df.get("uncertainty_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    recommendation_allowed = pd.to_numeric(df.get("recommendation_allowed"), errors="coerce").fillna(1.0) > 0.5
 
     mask = years.eq(float(eval_year)) & match_levels.isin(levels) & y.notna() & raw_prob.notna()
     subset = pd.DataFrame(
@@ -946,20 +1087,38 @@ def build_no_odds_eval_report(df_feats, baseline_config):
             "level": match_levels,
             "y": y,
             "prob_raw": raw_prob,
+            "uncertainty_score": uncertainty_score,
+            "recommendation_allowed": recommendation_allowed,
         }
     ).loc[mask].copy()
 
     split_date = pd.Timestamp(H1_H2_SPLIT_DATE)
-    calibrator_input = subset[subset["tourney_date"] < split_date][["tourney_date", "prob_raw", "y"]].copy()
+    calibrator_input = subset[subset["tourney_date"] < split_date][["tourney_date", "level", "prob_raw", "y"]].copy()
     calibrator_input = calibrator_input.rename(columns={"prob_raw": "prob_p1_win", "y": "p1_is_real_winner"})
-    calibrator = fit_probability_calibrator(calibrator_input)
+    if level_calibration_bundle is None:
+        level_calibration_bundle = fit_level_calibrators(calibrator_input, n_min_calib=MP_N_MIN_CALIB)
+    calibrator = level_calibration_bundle["global"]
+    level_calibrators = level_calibration_bundle["by_level"]
 
     if len(subset) > 0:
-        subset["prob_final"] = subset["prob_raw"].apply(
-            lambda p: apply_probability_pipeline(p, 2.0, baseline_config, calibrator=calibrator)[2]
+        subset["prob_final"] = subset.apply(
+            lambda r: apply_probability_pipeline(
+                r["prob_raw"],
+                2.0,
+                baseline_config,
+                calibrator=calibrator,
+                level=r["level"],
+                level_calibrators=level_calibrators,
+            )[2],
+            axis=1,
+        )
+        subset["effective_confidence"] = apply_uncertainty_to_confidence(
+            subset["prob_final"].to_numpy(dtype=float),
+            subset["uncertainty_score"].to_numpy(dtype=float),
         )
     else:
         subset["prob_final"] = np.nan
+        subset["effective_confidence"] = np.nan
 
     combined = compute_prob_metrics(subset["y"], subset["prob_final"], bins=10)
     by_level = {}
@@ -1031,35 +1190,87 @@ def build_no_odds_eval_report(df_feats, baseline_config):
         },
         "warnings": warnings,
         "calibrator_name": calibrator.get("name", "identity"),
+        "calibration_by_level": level_calibration_bundle.get("meta", {}),
         "odds_proxy_for_pipeline": 2.0,
+        "uncertainty_summary": {
+            "mean_uncertainty": safe_float_or_none(subset["uncertainty_score"].mean() if len(subset) > 0 else np.nan),
+            "share_recommendation_allowed": safe_float_or_none(
+                subset["recommendation_allowed"].mean() if len(subset) > 0 else np.nan
+            ),
+        },
     }
 
 
-def fit_probability_calibrator(df_side, min_train=200, min_val=120):
-    def identity_predict(x):
-        return np.asarray(x, dtype=float).clip(0.0, 1.0)
+def _identity_predict(x):
+    return np.asarray(x, dtype=float).clip(0.0, 1.0)
 
+
+def _build_calibrator_predict_fn(calibrator):
+    name = str((calibrator or {}).get("name", "identity")).lower()
+    if name == "sigmoid" and (calibrator or {}).get("sigmoid_model") is not None:
+        model = calibrator["sigmoid_model"]
+        return lambda x: model.predict_proba(np.asarray(x, dtype=float).reshape(-1, 1))[:, 1]
+    if name == "isotonic" and (calibrator or {}).get("isotonic_model") is not None:
+        model = calibrator["isotonic_model"]
+        return lambda x: np.asarray(model.predict(np.asarray(x, dtype=float)))
+    return _identity_predict
+
+
+def _with_predict_fn(calibrator):
+    out = dict(calibrator or {})
+    out["predict"] = _build_calibrator_predict_fn(out)
+    return out
+
+
+def _serialize_calibrator(calibrator):
+    if calibrator is None:
+        return None
+    out = dict(calibrator)
+    out.pop("predict", None)
+    return out
+
+
+def save_calibrator(calibrator, path):
+    p = path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(_serialize_calibrator(calibrator), p)
+    return p
+
+
+def fit_probability_calibrator(df_side, min_train=200, min_val=120):
     if df_side.empty:
-        return {
-            "name": "identity",
-            "predict": identity_predict,
-            "selection_primary_metric": "ece",
-            "selection_reason": "empty_dataset",
-            "metrics": {
-                "brier_raw_val": np.nan,
-                "brier_sigmoid_val": np.nan,
-                "brier_isotonic_val": np.nan,
-                "ece_raw_val": np.nan,
-                "ece_sigmoid_val": np.nan,
-                "ece_isotonic_val": np.nan,
-                "n_train": 0,
-                "n_val": 0,
-            },
-        }
+        return _with_predict_fn(
+            {
+                "name": "identity",
+                "selection_primary_metric": "ece",
+                "selection_reason": "empty_dataset",
+                "sigmoid_model": None,
+                "isotonic_model": None,
+                "metrics": {
+                    "brier_raw_val": np.nan,
+                    "brier_sigmoid_val": np.nan,
+                    "brier_isotonic_val": np.nan,
+                    "ece_raw_val": np.nan,
+                    "ece_sigmoid_val": np.nan,
+                    "ece_isotonic_val": np.nan,
+                    "n_train": 0,
+                    "n_val": 0,
+                },
+            }
+        )
 
     df = df_side.sort_values("tourney_date").copy()
-    df["raw"] = df["prob_p1_win"].astype(float).clip(0.0, 1.0)
-    df["y"] = df["p1_is_real_winner"].astype(int)
+    df["raw"] = pd.to_numeric(df.get("prob_p1_win"), errors="coerce").fillna(0.5).clip(0.0, 1.0)
+    if "p1_is_real_winner" in df.columns:
+        y_src = pd.to_numeric(df["p1_is_real_winner"], errors="coerce")
+    elif "target" in df.columns:
+        y_src = pd.to_numeric(df["target"], errors="coerce")
+    else:
+        y_src = pd.Series(np.nan, index=df.index, dtype="float64")
+    y_src = y_src.where(y_src.isin([0, 1]))
+    df["y"] = y_src
+    df = df.dropna(subset=["raw", "y"]).copy()
+    df["y"] = df["y"].astype(int)
 
     n = len(df)
     split_idx = max(min_train, int(n * 0.70))
@@ -1068,23 +1279,30 @@ def fit_probability_calibrator(df_side, min_train=200, min_val=120):
 
     if split_idx <= 0 or (n - split_idx) < min_val:
         brier_raw = float(np.mean((df["raw"] - df["y"]) ** 2)) if n > 0 else np.nan
-        ece_raw, _, _, _, _ = compute_ece_mce(df["raw"].to_numpy(), df["y"].to_numpy(), bins=10) if n > 0 else (np.nan, np.nan, np.array([]), np.array([]), np.array([]))
-        return {
-            "name": "identity",
-            "predict": identity_predict,
-            "selection_primary_metric": "ece",
-            "selection_reason": "insufficient_validation_window",
-            "metrics": {
-                "brier_raw_val": brier_raw,
-                "brier_sigmoid_val": np.nan,
-                "brier_isotonic_val": np.nan,
-                "ece_raw_val": float(ece_raw),
-                "ece_sigmoid_val": np.nan,
-                "ece_isotonic_val": np.nan,
-                "n_train": int(max(0, split_idx)),
-                "n_val": int(max(0, n - split_idx)),
-            },
-        }
+        ece_raw, _, _, _, _ = (
+            compute_ece_mce(df["raw"].to_numpy(), df["y"].to_numpy(), bins=10)
+            if n > 0
+            else (np.nan, np.nan, np.array([]), np.array([]), np.array([]))
+        )
+        return _with_predict_fn(
+            {
+                "name": "identity",
+                "selection_primary_metric": "ece",
+                "selection_reason": "insufficient_validation_window",
+                "sigmoid_model": None,
+                "isotonic_model": None,
+                "metrics": {
+                    "brier_raw_val": brier_raw,
+                    "brier_sigmoid_val": np.nan,
+                    "brier_isotonic_val": np.nan,
+                    "ece_raw_val": float(ece_raw),
+                    "ece_sigmoid_val": np.nan,
+                    "ece_isotonic_val": np.nan,
+                    "n_train": int(max(0, split_idx)),
+                    "n_val": int(max(0, n - split_idx)),
+                },
+            }
+        )
 
     tr = df.iloc[:split_idx]
     va = df.iloc[split_idx:]
@@ -1105,9 +1323,9 @@ def fit_probability_calibrator(df_side, min_train=200, min_val=120):
     }
     metrics["ece_raw_val"] = float(compute_ece_mce(x_va, y_va, bins=10)[0])
 
-    sigmoid = LogisticRegression(max_iter=1000, solver="lbfgs")
-    sigmoid.fit(x_tr.reshape(-1, 1), y_tr)
-    p_sig = sigmoid.predict_proba(x_va.reshape(-1, 1))[:, 1]
+    sigmoid_model = LogisticRegression(max_iter=1000, solver="lbfgs")
+    sigmoid_model.fit(x_tr.reshape(-1, 1), y_tr)
+    p_sig = sigmoid_model.predict_proba(x_va.reshape(-1, 1))[:, 1]
     metrics["brier_sigmoid_val"] = float(np.mean((p_sig - y_va) ** 2))
     metrics["ece_sigmoid_val"] = float(compute_ece_mce(p_sig, y_va, bins=10)[0])
 
@@ -1127,15 +1345,18 @@ def fit_probability_calibrator(df_side, min_train=200, min_val=120):
 
     candidates = [c for c in candidates if np.isfinite(c[1]) and np.isfinite(c[2])]
     if not candidates:
-        return {
-            "name": "identity",
-            "predict": identity_predict,
-            "selection_primary_metric": "ece",
-            "selection_reason": "no_valid_candidates",
-            "metrics": metrics,
-        }
+        return _with_predict_fn(
+            {
+                "name": "identity",
+                "selection_primary_metric": "ece",
+                "selection_reason": "no_valid_candidates",
+                "sigmoid_model": None,
+                "isotonic_model": None,
+                "metrics": metrics,
+            }
+        )
 
-    best_name, best_ece, best_brier = sorted(candidates, key=lambda x: (x[1], x[2]))[0]
+    best_name, _, best_brier = sorted(candidates, key=lambda x: (x[1], x[2]))[0]
     guardrail_margin = 0.003
     selection_reason = f"min_ece_then_brier:{best_name}"
     if best_brier > metrics["brier_raw_val"] + guardrail_margin:
@@ -1143,25 +1364,78 @@ def fit_probability_calibrator(df_side, min_train=200, min_val=120):
         selection_reason = "guardrail_brier_degradation"
 
     if best_name == "identity":
-        predict_fn = identity_predict
+        sig_model = None
+        iso_model = None
     elif best_name == "sigmoid":
-        predict_fn = lambda x: sigmoid.predict_proba(np.asarray(x, dtype=float).reshape(-1, 1))[:, 1]
+        sig_model = sigmoid_model
+        iso_model = None
     else:
-        predict_fn = lambda x: np.asarray(isotonic_model.predict(np.asarray(x, dtype=float)))
+        sig_model = None
+        iso_model = isotonic_model
 
+    return _with_predict_fn(
+        {
+            "name": best_name,
+            "selection_primary_metric": "ece",
+            "selection_reason": selection_reason,
+            "sigmoid_model": sig_model,
+            "isotonic_model": iso_model,
+            "metrics": metrics,
+        }
+    )
+
+
+def fit_level_calibrators(df_side, n_min_calib=500):
+    working = df_side.copy()
+    working["level"] = infer_match_levels(working).fillna("A")
+    global_calibrator = fit_probability_calibrator(working)
+
+    by_level = {}
+    meta = {}
+    for level in ["A", "C", "F"]:
+        level_df = working[working["level"] == level].copy()
+        n_rows = int(len(level_df))
+        if n_rows >= int(n_min_calib):
+            cal = fit_probability_calibrator(level_df)
+            fallback_used = False
+            fallback_reason = "none"
+        else:
+            cal = global_calibrator
+            fallback_used = True
+            fallback_reason = f"n_matches_below_min:{n_rows}<{int(n_min_calib)}"
+        by_level[level] = cal
+        meta[level] = {
+            "n_matches": n_rows,
+            "calibrator_name": cal.get("name", "identity"),
+            "fallback_used": bool(fallback_used),
+            "fallback_reason": fallback_reason,
+            "selection_reason": cal.get("selection_reason", "n/a"),
+            "metrics": cal.get("metrics", {}),
+        }
+        save_calibrator(cal, CALIBRATION_DIR / f"calibrator_{level}.pkl")
+
+    save_calibrator(global_calibrator, CALIBRATION_DIR / "calibrator_global.pkl")
     return {
-        "name": best_name,
-        "predict": predict_fn,
-        "selection_primary_metric": "ece",
-        "selection_reason": selection_reason,
-        "metrics": metrics,
+        "global": global_calibrator,
+        "by_level": by_level,
+        "meta": meta,
+        "calibration_dir": str(CALIBRATION_DIR),
+        "n_min_calib": int(n_min_calib),
     }
 
 
-def apply_probability_pipeline(raw_prob, odd_raw, cfg, calibrator=None):
+def resolve_level_calibrator(level, calibrator=None, level_calibrators=None):
+    lvl = _normalize_level_scalar(level)
+    if lvl is not None and isinstance(level_calibrators, dict) and lvl in level_calibrators:
+        return level_calibrators[lvl]
+    return calibrator
+
+
+def apply_probability_pipeline(raw_prob, odd_raw, cfg, calibrator=None, level=None, level_calibrators=None):
     raw = float(np.clip(raw_prob, 0.0, 1.0))
-    if calibrator is not None:
-        calibrated = float(np.clip(calibrator["predict"]([raw])[0], 0.0, 1.0))
+    cal = resolve_level_calibrator(level=level, calibrator=calibrator, level_calibrators=level_calibrators)
+    if cal is not None:
+        calibrated = float(np.clip(cal["predict"]([raw])[0], 0.0, 1.0))
     else:
         calibrated = raw
 
@@ -1183,6 +1457,7 @@ def simulate_strategy(
     initial_bankroll=1000.0,
     compute_bootstrap=True,
     calibrator=None,
+    level_calibrators=None,
     fixed_selection=None,
     fixed_sizing_no_cost=False,
 ):
@@ -1209,6 +1484,7 @@ def simulate_strategy(
             "history": [initial_bankroll],
             "skip": {},
             "selected_decisions": {},
+            "bet_records": [],
         }
 
     skip = {
@@ -1220,6 +1496,7 @@ def simulate_strategy(
         "low_kelly": 0,
         "low_signal": 0,
         "rank_cap": 0,
+        "high_uncertainty": 0,
     }
 
     if fixed_selection is None:
@@ -1243,7 +1520,21 @@ def simulate_strategy(
                 continue
 
             fair_p1 = implied_p1 / overround
-            _, p_cal, p_model = apply_probability_pipeline(row.prob_p1_win, odd_p1_raw, cfg, calibrator=calibrator)
+            uncertainty_score = clip01(getattr(row, "uncertainty_score", 0.0))
+            recommendation_allowed = bool(getattr(row, "recommendation_allowed", True))
+            if (not recommendation_allowed) or uncertainty_score > float(MP_MAX_UNCERTAINTY_FOR_RECO):
+                skip["high_uncertainty"] += 1
+                continue
+
+            _, p_cal, p_model_raw = apply_probability_pipeline(
+                row.prob_p1_win,
+                odd_p1_raw,
+                cfg,
+                calibrator=calibrator,
+                level=getattr(row, "level", None),
+                level_calibrators=level_calibrators,
+            )
+            p_model = float(apply_uncertainty_to_confidence([p_model_raw], [uncertainty_score])[0])
             if p_model < float(cfg["min_confidence"]):
                 skip["low_conf"] += 1
                 continue
@@ -1276,11 +1567,16 @@ def simulate_strategy(
             decision = {
                 "p_raw": float(row.prob_p1_win),
                 "p_calibrated": p_cal,
+                "p_model_raw": float(p_model_raw),
                 "p_sel": p_model,
                 "odd_sel_raw": odd_p1_raw,
                 "odd_sel_eff": odd_p1_eff,
                 "signal": signal,
                 "p1_is_real_winner": bool(row.p1_is_real_winner),
+                "uncertainty_score": uncertainty_score,
+                "recommendation_allowed": recommendation_allowed,
+                "effective_confidence": p_model,
+                "level": _normalize_level_scalar(getattr(row, "level", None)),
             }
             prev = decisions.get(row_id)
             if prev is None or decision["signal"] > prev["signal"]:
@@ -1305,6 +1601,7 @@ def simulate_strategy(
     history = [bankroll]
     bet_pnls = []
     equity_rows = []
+    bet_records = []
 
     timeline = df_sim.groupby("odds_row_id", as_index=False)["tourney_date"].min().sort_values("tourney_date")
     for row in timeline.itertuples(index=False):
@@ -1343,6 +1640,18 @@ def simulate_strategy(
                 pnl = stake * (odd_sel_eff - 1.0) - cost
                 wins += 1
             bet_pnls.append(pnl)
+            bet_records.append(
+                {
+                    "odds_row_id": row_id,
+                    "tourney_date": str(pd.to_datetime(date).date()),
+                    "level": decision.get("level"),
+                    "odd_sel_raw": float(odd_sel_raw),
+                    "stake": float(stake),
+                    "pnl": float(pnl),
+                    "effective_confidence": float(decision.get("effective_confidence", p_sel)),
+                    "uncertainty_score": float(decision.get("uncertainty_score", 0.0)),
+                }
+            )
 
         history.append(bankroll)
         equity_rows.append({"tourney_date": date, "bankroll": bankroll})
@@ -1383,6 +1692,7 @@ def simulate_strategy(
         "history": history,
         "skip": skip,
         "selected_decisions": selected,
+        "bet_records": bet_records,
     }
 
 
@@ -1406,7 +1716,7 @@ def print_strategy_report(result):
     print(
         f"Skip odds range: {s.get('odds_range', 0)} | Skip dyn-edge: {s.get('dyn_edge', 0)} | "
         f"Skip low Kelly: {s.get('low_kelly', 0)} | Skip low signal: {s.get('low_signal', 0)} | "
-        f"Skip rank cap: {s.get('rank_cap', 0)}"
+        f"Skip rank cap: {s.get('rank_cap', 0)} | Skip high uncertainty: {s.get('high_uncertainty', 0)}"
     )
 
     # Point 2: robustness block
@@ -1477,7 +1787,14 @@ def build_fold_period_columns(date_series, fold_freq):
     return labels.astype(str), sort_key.astype(int)
 
 
-def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_label="Tuning", print_progress=False):
+def tune_strategy_config(
+    df_train,
+    baseline_config,
+    calibrator=None,
+    level_calibrators=None,
+    progress_label="Tuning",
+    print_progress=False,
+):
     objective_formula = f"{OBJECTIVE_MODE} (lambda={LAMBDA_BETS})"
     keys, full_combos, restricted_mode = build_tuning_search_space()
     sampled_mode = (not restricted_mode) and len(full_combos) > MAX_TUNING_EVALS
@@ -1499,6 +1816,7 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
         initial_bankroll=1000.0,
         compute_bootstrap=False,
         calibrator=calibrator,
+        level_calibrators=level_calibrators,
     )
     baseline_objective = compute_tuning_objective(baseline_res["roi"], baseline_res["bets"], n_matches_train)
     baseline_bets = int(baseline_res["bets"])
@@ -1515,7 +1833,14 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
         for k, v in zip(keys, values):
             cfg[k] = float(v)
 
-        res = simulate_strategy(df_train, cfg, initial_bankroll=1000.0, compute_bootstrap=False, calibrator=calibrator)
+        res = simulate_strategy(
+            df_train,
+            cfg,
+            initial_bankroll=1000.0,
+            compute_bootstrap=False,
+            calibrator=calibrator,
+            level_calibrators=level_calibrators,
+        )
         objective = compute_tuning_objective(res["roi"], res["bets"], n_matches_train)
         cons = config_conservativeness_score(cfg)
         feasible_gate = float(res["max_drawdown_pct"]) <= 5.0 and int(res["bets"]) >= int(MIN_BETS_FOR_TUNING)
@@ -1686,7 +2011,7 @@ def tune_strategy_config(df_train, baseline_config, calibrator=None, progress_la
     return best_cfg, best_res, float(best_objective), df_tuning, diagnostics
 
 
-def build_calibration_report(df_sim, baseline_config, calibrator=None, bins=10):
+def build_calibration_report(df_sim, baseline_config, calibrator=None, level_calibrators=None, bins=10):
     cols = [
         "bin",
         "n",
@@ -1723,8 +2048,16 @@ def build_calibration_report(df_sim, baseline_config, calibrator=None, bins=10):
 
     calibrated_arr = []
     shrunk_arr = []
-    for row in cal.itertuples(index=False):
-        _, p_cal, p_final = apply_probability_pipeline(row.pred_raw, float(row.odd_p1), baseline_config, calibrator=calibrator)
+    level_arr = infer_match_levels(df_sim).fillna("A").to_numpy()
+    for row, level_value in zip(cal.itertuples(index=False), level_arr):
+        _, p_cal, p_final = apply_probability_pipeline(
+            row.pred_raw,
+            float(row.odd_p1),
+            baseline_config,
+            calibrator=calibrator,
+            level=level_value,
+            level_calibrators=level_calibrators,
+        )
         calibrated_arr.append(p_cal)
         shrunk_arr.append(p_final)
     cal["pred_calibrated"] = np.asarray(calibrated_arr, dtype=float).clip(0.0, 1.0)
@@ -1795,7 +2128,153 @@ def build_calibration_report(df_sim, baseline_config, calibrator=None, bins=10):
     return report, grouped
 
 
-def run_stress_tests(df_sim, baseline_config, calibrator=None, baseline_selection=None, run_context=None):
+def build_bucket_reports(
+    df_sim,
+    baseline_config,
+    baseline_result,
+    calibrator=None,
+    level_calibrators=None,
+):
+    if not MP_ENABLE_BUCKET_REPORTS:
+        return None
+
+    work = df_sim.copy()
+    if work.empty:
+        return None
+
+    levels = infer_match_levels(work).fillna("A")
+    calibrated = []
+    for row in work.itertuples(index=False):
+        _, _, p_final = apply_probability_pipeline(
+            row.prob_p1_win,
+            float(row.odd_p1),
+            baseline_config,
+            calibrator=calibrator,
+            level=getattr(row, "level", None),
+            level_calibrators=level_calibrators,
+        )
+        calibrated.append(p_final)
+    work["p_calibrated"] = np.asarray(calibrated, dtype=float).clip(0.0, 1.0)
+    work["level"] = levels
+    work["y"] = pd.to_numeric(work["p1_is_real_winner"], errors="coerce").fillna(0).astype(int)
+    work["uncertainty_score"] = pd.to_numeric(work.get("uncertainty_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    work["effective_confidence"] = apply_uncertainty_to_confidence(
+        work["p_calibrated"].to_numpy(dtype=float),
+        work["uncertainty_score"].to_numpy(dtype=float),
+    )
+    work["recommendation_allowed"] = work["uncertainty_score"] <= float(MP_MAX_UNCERTAINTY_FOR_RECO)
+
+    bet_df = pd.DataFrame((baseline_result or {}).get("bet_records", []))
+    if not bet_df.empty:
+        bet_df["odds_row_id"] = pd.to_numeric(bet_df["odds_row_id"], errors="coerce").astype("Int64")
+        work = work.merge(
+            bet_df[["odds_row_id", "stake", "pnl"]],
+            on="odds_row_id",
+            how="left",
+        )
+    else:
+        work["stake"] = np.nan
+        work["pnl"] = np.nan
+
+    p_edges = make_probability_bucket_edges(step=MP_BUCKET_STEP, start=0.50, end=1.00)
+    if len(p_edges) < 2:
+        p_edges = np.array([0.50, 1.00], dtype=float)
+    work["p_bucket"] = pd.cut(work["p_calibrated"], bins=p_edges, include_lowest=True, right=False)
+    work["uncertainty_bucket"] = pd.cut(
+        work["uncertainty_score"],
+        bins=np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.000001], dtype=float),
+        include_lowest=True,
+        right=False,
+    )
+    work["odds_bucket"] = pd.cut(
+        pd.to_numeric(work["odd_p1"], errors="coerce"),
+        bins=np.array([1.4, 1.7, 2.1, 2.7, 100.0], dtype=float),
+        include_lowest=True,
+        right=False,
+    )
+
+    p_report = make_bucket_report(work, "p_bucket", "p_calibrated", "y")
+    p_report.to_csv(RELIABILITY_BY_P_BUCKET_FILE, index=False)
+
+    uncertainty_report = make_bucket_report(work, "uncertainty_bucket", "p_calibrated", "y")
+    uncertainty_report.to_csv(RELIABILITY_BY_UNCERTAINTY_BUCKET_FILE, index=False)
+
+    atp_work = work[work["level"] == "A"].copy()
+    odds_report = make_bucket_report(
+        atp_work,
+        "odds_bucket",
+        "p_calibrated",
+        "y",
+        stake_col="stake",
+        pnl_col="pnl",
+    )
+    odds_report.to_csv(RELIABILITY_BY_ODDS_BUCKET_FILE, index=False)
+
+    p_gap_extremes = summarize_bucket_extremes(p_report, "calibration_gap", n=3, prefer_small_abs=True)
+    u_gap_extremes = summarize_bucket_extremes(uncertainty_report, "calibration_gap", n=3, prefer_small_abs=True)
+    odds_roi_extremes = summarize_bucket_extremes(odds_report, "roi_bucket_pct", n=3, prefer_small_abs=False)
+
+    print("    Bucket summary - calibration gap (p_bucket) best/worst:")
+    print(f"      best={p_gap_extremes['best']}")
+    print(f"      worst={p_gap_extremes['worst']}")
+    print("    Bucket summary - calibration gap (uncertainty_bucket) best/worst:")
+    print(f"      best={u_gap_extremes['best']}")
+    print(f"      worst={u_gap_extremes['worst']}")
+    print("    Bucket summary - ROI (odds_bucket, ATP) best/worst:")
+    print(f"      best={odds_roi_extremes['best']}")
+    print(f"      worst={odds_roi_extremes['worst']}")
+
+    return {
+        "enabled": True,
+        "files": {
+            "p_bucket": str(RELIABILITY_BY_P_BUCKET_FILE),
+            "uncertainty_bucket": str(RELIABILITY_BY_UNCERTAINTY_BUCKET_FILE),
+            "odds_bucket": str(RELIABILITY_BY_ODDS_BUCKET_FILE),
+        },
+        "extremes": {
+            "p_bucket_calibration_gap": p_gap_extremes,
+            "uncertainty_bucket_calibration_gap": u_gap_extremes,
+            "odds_bucket_roi": odds_roi_extremes,
+        },
+    }
+
+
+def build_calibration_metrics_by_level(df_sim, baseline_config, calibrator=None, level_calibrators=None):
+    if df_sim.empty:
+        return {}
+
+    levels = infer_match_levels(df_sim).fillna("A")
+    y = pd.to_numeric(df_sim["p1_is_real_winner"], errors="coerce")
+    p_raw = pd.to_numeric(df_sim["prob_p1_win"], errors="coerce").fillna(0.5).clip(0.0, 1.0)
+
+    p_final = []
+    for row, level_value in zip(df_sim.itertuples(index=False), levels.to_numpy()):
+        _, _, p_adj = apply_probability_pipeline(
+            row.prob_p1_win,
+            float(row.odd_p1),
+            baseline_config,
+            calibrator=calibrator,
+            level=level_value,
+            level_calibrators=level_calibrators,
+        )
+        p_final.append(p_adj)
+    p_final = pd.Series(np.asarray(p_final, dtype=float), index=df_sim.index)
+
+    out = {}
+    for level in ["A", "C", "F"]:
+        mask = levels == level
+        out[level] = compute_prob_metrics(y[mask], p_final[mask], bins=10)
+    return out
+
+
+def run_stress_tests(
+    df_sim,
+    baseline_config,
+    calibrator=None,
+    level_calibrators=None,
+    baseline_selection=None,
+    run_context=None,
+):
     print("\n[8] Stress Test (haircut + commission + slippage)...")
     fixed_rows = []
     adaptive_rows = []
@@ -1809,6 +2288,7 @@ def run_stress_tests(df_sim, baseline_config, calibrator=None, baseline_selectio
             initial_bankroll=1000.0,
             compute_bootstrap=False,
             calibrator=calibrator,
+            level_calibrators=level_calibrators,
             fixed_selection=baseline_selection,
             fixed_sizing_no_cost=True,
         )
@@ -1818,6 +2298,7 @@ def run_stress_tests(df_sim, baseline_config, calibrator=None, baseline_selectio
             initial_bankroll=1000.0,
             compute_bootstrap=False,
             calibrator=calibrator,
+            level_calibrators=level_calibrators,
             fixed_selection=None,
             fixed_sizing_no_cost=False,
         )
@@ -1865,7 +2346,7 @@ def run_stress_tests(df_sim, baseline_config, calibrator=None, baseline_selectio
         print("    [WARN] Fixed mode ROI non monotono rispetto ai costi.")
     payload = add_report_metadata(payload, run_context)
     with open(STRESS_REPORT_FILE, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(payload, f, indent=2, default=str)
     print(f"    Report stress salvato in: {STRESS_REPORT_FILE}")
     return payload
 
@@ -1953,11 +2434,14 @@ def run_walk_forward_validation(df_sim, baseline_config, run_context=None):
             )
             continue
 
-        fold_calibrator = fit_probability_calibrator(df_train)
+        fold_calibration_bundle = fit_level_calibrators(df_train, n_min_calib=MP_N_MIN_CALIB)
+        fold_calibrator = fold_calibration_bundle["global"]
+        fold_level_calibrators = fold_calibration_bundle["by_level"]
         best_cfg, best_h_train, best_score, _, tuning_diag = tune_strategy_config(
             df_train,
             baseline_config,
             calibrator=fold_calibrator,
+            level_calibrators=fold_level_calibrators,
             progress_label=f"WF {test_period}",
             print_progress=True,
         )
@@ -1967,6 +2451,7 @@ def run_walk_forward_validation(df_sim, baseline_config, run_context=None):
             initial_bankroll=1000.0,
             compute_bootstrap=False,
             calibrator=fold_calibrator,
+            level_calibrators=fold_level_calibrators,
         )
         base_objective = compute_tuning_objective(base_train["roi"], base_train["bets"], train_matches)
         best_objective = float(best_score)
@@ -1993,6 +2478,7 @@ def run_walk_forward_validation(df_sim, baseline_config, run_context=None):
             initial_bankroll=baseline_bank,
             compute_bootstrap=False,
             calibrator=fold_calibrator,
+            level_calibrators=fold_level_calibrators,
         )
         tuned_test = simulate_strategy(
             df_test,
@@ -2000,6 +2486,7 @@ def run_walk_forward_validation(df_sim, baseline_config, run_context=None):
             initial_bankroll=tuned_bank,
             compute_bootstrap=False,
             calibrator=fold_calibrator,
+            level_calibrators=fold_level_calibrators,
         )
 
         bets_delta_txt = f"{bets_increase_pct:+.2f}%" if np.isfinite(bets_increase_pct) else "n/a"
@@ -2107,7 +2594,7 @@ def run_walk_forward_validation(df_sim, baseline_config, run_context=None):
     }
     wf_report = add_report_metadata(wf_report, run_context)
     with open(WALKFORWARD_REPORT_FILE, "w", encoding="utf-8") as f:
-        json.dump(wf_report, f, indent=2)
+        json.dump(wf_report, f, indent=2, default=str)
     print(f"    Report walk-forward salvato in: {WALKFORWARD_REPORT_FILE}")
     return wf_report
 
@@ -2126,7 +2613,9 @@ def run_temporal_validation(df_sim, baseline_config):
         print("    [WARN] Split H1/H2 non valido. Salto validazione temporale.")
         return None
 
-    calibrator_h1 = fit_probability_calibrator(df_h1)
+    h1_calibration_bundle = fit_level_calibrators(df_h1, n_min_calib=MP_N_MIN_CALIB)
+    calibrator_h1 = h1_calibration_bundle["global"]
+    h1_level_calibrators = h1_calibration_bundle["by_level"]
 
     baseline_h1 = simulate_strategy(
         df_h1,
@@ -2134,6 +2623,7 @@ def run_temporal_validation(df_sim, baseline_config):
         initial_bankroll=1000.0,
         compute_bootstrap=False,
         calibrator=calibrator_h1,
+        level_calibrators=h1_level_calibrators,
     )
     baseline_h2 = simulate_strategy(
         df_h2,
@@ -2141,6 +2631,7 @@ def run_temporal_validation(df_sim, baseline_config):
         initial_bankroll=1000.0,
         compute_bootstrap=True,
         calibrator=calibrator_h1,
+        level_calibrators=h1_level_calibrators,
     )
     print(f"    Baseline H1 ROI: {baseline_h1['roi']:.2f}% | Bets: {baseline_h1['bets']}")
     print(f"    Baseline H2 ROI: {baseline_h2['roi']:.2f}% | Bets: {baseline_h2['bets']}")
@@ -2162,6 +2653,7 @@ def run_temporal_validation(df_sim, baseline_config):
         df_h1,
         baseline_config,
         calibrator=calibrator_h1,
+        level_calibrators=h1_level_calibrators,
         progress_label="Tuning progress",
         print_progress=True,
     )
@@ -2172,6 +2664,7 @@ def run_temporal_validation(df_sim, baseline_config):
         initial_bankroll=1000.0,
         compute_bootstrap=True,
         calibrator=calibrator_h1,
+        level_calibrators=h1_level_calibrators,
     )
     print(f"    Best H1 ROI: {best_h1['roi']:.2f}% | Bets: {best_h1['bets']} | Objective: {best_score:.4f}")
     print(f"    Tuned H2 ROI: {tuned_h2['roi']:.2f}% | Bets: {tuned_h2['bets']}")
@@ -2225,6 +2718,7 @@ def run_temporal_validation(df_sim, baseline_config):
             "name": calibrator_h1["name"],
             "metrics": calibrator_h1["metrics"],
         },
+        "calibration_by_level_h1": h1_calibration_bundle.get("meta", {}),
         "tuning_diagnostics": tuning_diag,
     }
     return report
@@ -2367,6 +2861,11 @@ def run_backtest_v7():
         f"lambda_bets={LAMBDA_BETS} | guardrail_max_bets_inc={MAX_BETS_INCREASE_PCT:.2f} | "
         f"restricted_mode={RESTRICTED_TUNING_MODE} | fold_freq={FOLD_FREQ}"
     )
+    print(
+        f"[UNCERTAINTY] max_for_reco={MP_MAX_UNCERTAINTY_FOR_RECO:.2f} | "
+        f"weights={MP_UNCERTAINTY_WEIGHTS} | n_min_calib={MP_N_MIN_CALIB} | "
+        f"bucket_step={MP_BUCKET_STEP:.2f} | bucket_reports={MP_ENABLE_BUCKET_REPORTS}"
+    )
 
     migration = ensure_data_layout()
     moved = migration.get("moved", [])
@@ -2404,11 +2903,22 @@ def run_backtest_v7():
     except Exception as e:
         print(f"    [ERROR] Errore features/modello: {e}")
         return
+
+    split_date = pd.Timestamp(H1_H2_SPLIT_DATE)
+    df_pre_h2_features = df_feats[df_feats["tourney_date"] < split_date].copy()
+    level_calibration_bundle = fit_level_calibrators(df_pre_h2_features, n_min_calib=MP_N_MIN_CALIB)
+    global_calibrator = level_calibration_bundle["global"]
+    level_calibrators = level_calibration_bundle["by_level"]
+
     no_odds_report = None
     if bool(BASELINE_CONFIG.get("no_odds_eval_enabled", False)):
         print("\n[2b] Valutazione Model-Only C/F (senza quote)...")
         try:
-            no_odds_report = build_no_odds_eval_report(df_feats, BASELINE_CONFIG)
+            no_odds_report = build_no_odds_eval_report(
+                df_feats,
+                BASELINE_CONFIG,
+                level_calibration_bundle=level_calibration_bundle,
+            )
             gate = no_odds_report.get("gate", {})
             print(
                 f"    C/F combined matches: {no_odds_report.get('combined', {}).get('n_matches', 0)} | "
@@ -2451,9 +2961,6 @@ def run_backtest_v7():
     # 5. BASELINE SIMULATION
     print("\n[5] Simulazione Value Betting (Fair Odds + Kelly + Top Signals)...")
     baseline_snapshot = freeze_baseline_config(BASELINE_CONFIG, run_context=run_context, path=BASELINE_CONFIG_FILE)
-    split_date = pd.Timestamp(H1_H2_SPLIT_DATE)
-    df_pre_h2 = df_sim[df_sim["tourney_date"] < split_date].copy()
-    global_calibrator = fit_probability_calibrator(df_pre_h2)
     print(f"    Calibrator globale (pre-H2): {global_calibrator['name']}")
     baseline_result = simulate_strategy(
         df_sim,
@@ -2461,6 +2968,7 @@ def run_backtest_v7():
         initial_bankroll=1000.0,
         compute_bootstrap=True,
         calibrator=global_calibrator,
+        level_calibrators=level_calibrators,
     )
     print_strategy_report(baseline_result)
 
@@ -2472,7 +2980,13 @@ def run_backtest_v7():
 
     # 6. CALIBRAZIONE (Reliability Curve + bins)
     print("\n[6] Calibrazione Probabilistica (Reliability bins)...")
-    calibration_report, calibration_table = build_calibration_report(df_sim, BASELINE_CONFIG, calibrator=global_calibrator, bins=10)
+    calibration_report, calibration_table = build_calibration_report(
+        df_sim,
+        BASELINE_CONFIG,
+        calibrator=global_calibrator,
+        level_calibrators=level_calibrators,
+        bins=10,
+    )
     print(
         f"    Brier raw: {calibration_report['brier_raw']:.4f} | "
         f"Brier calibrated: {calibration_report['brier_calibrated']:.4f} | "
@@ -2493,6 +3007,19 @@ def run_backtest_v7():
             ["bin", "n", "calibrated_pred", "avg_pred_shrunk", "win_rate", "gap_calibrated", "ece_component"]
         ].head(10).to_string(index=False)
     )
+    calibration_metrics_by_level = build_calibration_metrics_by_level(
+        df_sim,
+        BASELINE_CONFIG,
+        calibrator=global_calibrator,
+        level_calibrators=level_calibrators,
+    )
+    bucket_reports = build_bucket_reports(
+        df_sim,
+        BASELINE_CONFIG,
+        baseline_result=baseline_result,
+        calibrator=global_calibrator,
+        level_calibrators=level_calibrators,
+    )
 
     # 7. TEMPORAL VALIDATION (H1 tuning -> H2 test)
     temporal_report = run_temporal_validation(df_sim, BASELINE_CONFIG)
@@ -2502,6 +3029,7 @@ def run_backtest_v7():
         df_sim,
         BASELINE_CONFIG,
         calibrator=global_calibrator,
+        level_calibrators=level_calibrators,
         baseline_selection=baseline_result.get("selected_decisions", {}),
         run_context=run_context,
     )
@@ -2524,6 +3052,11 @@ def run_backtest_v7():
         "baseline_config": BASELINE_CONFIG,
         "baseline_config_snapshot": baseline_snapshot,
         "tuning_runtime": BACKTEST_TUNING_RUNTIME,
+        "uncertainty_config": {
+            "max_uncertainty_for_reco": float(MP_MAX_UNCERTAINTY_FOR_RECO),
+            "weights": MP_UNCERTAINTY_WEIGHTS,
+        },
+        "calibration_by_level": level_calibration_bundle.get("meta", {}),
         "active_model": ACTIVE_MODEL,
         "merge_stats": merge_stats,
         "baseline_result": {
@@ -2535,6 +3068,7 @@ def run_backtest_v7():
             "max_drawdown_pct": baseline_result["max_drawdown_pct"],
             "profit_factor": baseline_result["profit_factor"],
             "bootstrap_roi_ci": baseline_result["bootstrap_roi_ci"],
+            "skip": baseline_result.get("skip", {}),
         },
         "calibration": {
             "brier_raw": calibration_report["brier_raw"],
@@ -2560,11 +3094,14 @@ def run_backtest_v7():
             "ece_isotonic_val": (global_calibrator.get("metrics") or {}).get("ece_isotonic_val"),
             "calibrator_validation_metrics": global_calibrator.get("metrics", {}),
         },
+        "calibration_metrics_by_level": calibration_metrics_by_level,
         "temporal_validation": temporal_report,
         "tuning_diagnostics": (temporal_report or {}).get("tuning_diagnostics"),
         "stress_tests": stress_report,
         "walk_forward": walkforward_report,
     }
+    if bucket_reports is not None:
+        consolidated["bucket_reports"] = bucket_reports
     if no_odds_report is not None:
         consolidated["no_odds_eval"] = no_odds_report
 
@@ -2591,7 +3128,7 @@ def run_backtest_v7():
 
     consolidated = add_report_metadata(consolidated, run_context)
     with open(VALIDATION_REPORT_FILE, "w", encoding="utf-8") as f:
-        json.dump(consolidated, f, indent=2)
+        json.dump(consolidated, f, indent=2, default=str)
     print(f"\nReport consolidato salvato in: {VALIDATION_REPORT_FILE}")
     print("\n[11] OOS Gate Decision")
     print(f"    Status: {oos_gate['status']} | Pass: {oos_gate['pass']}")
