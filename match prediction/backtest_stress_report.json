@@ -1,0 +1,90 @@
+{
+  "fixed_bets_cost_impact": [
+    {
+      "scenario": "baseline",
+      "payout_haircut_pct": 0.0,
+      "commission_pct": 0.0,
+      "slippage_pct": 0.0,
+      "roi": 2.2522777918024075,
+      "bets": 82,
+      "max_drawdown_pct": 2.207038030335847,
+      "profit_factor": 1.1855587449034515
+    },
+    {
+      "scenario": "mild",
+      "payout_haircut_pct": 0.01,
+      "commission_pct": 0.002,
+      "slippage_pct": 0.002,
+      "roi": 1.986389946645704,
+      "bets": 82,
+      "max_drawdown_pct": 2.2337347615506786,
+      "profit_factor": 1.1631952022035623
+    },
+    {
+      "scenario": "medium",
+      "payout_haircut_pct": 0.02,
+      "commission_pct": 0.003,
+      "slippage_pct": 0.003,
+      "roi": 1.7809171691631265,
+      "bets": 82,
+      "max_drawdown_pct": 2.2517112563677126,
+      "profit_factor": 1.146157366205939
+    },
+    {
+      "scenario": "hard",
+      "payout_haircut_pct": 0.03,
+      "commission_pct": 0.005,
+      "slippage_pct": 0.005,
+      "roi": 1.5162351480106053,
+      "bets": 82,
+      "max_drawdown_pct": 2.278397417300172,
+      "profit_factor": 1.1240900140712375
+    }
+  ],
+  "adaptive_with_costs": [
+    {
+      "scenario": "baseline",
+      "payout_haircut_pct": 0.0,
+      "commission_pct": 0.0,
+      "slippage_pct": 0.0,
+      "roi": 2.2522777918024075,
+      "bets": 82,
+      "max_drawdown_pct": 2.207038030335847,
+      "profit_factor": 1.1855587449034515
+    },
+    {
+      "scenario": "mild",
+      "payout_haircut_pct": 0.01,
+      "commission_pct": 0.002,
+      "slippage_pct": 0.002,
+      "roi": 2.4376260209310203,
+      "bets": 80,
+      "max_drawdown_pct": 2.185887828510141,
+      "profit_factor": 1.2137094900678747
+    },
+    {
+      "scenario": "medium",
+      "payout_haircut_pct": 0.02,
+      "commission_pct": 0.003,
+      "slippage_pct": 0.003,
+      "roi": 1.8631959730180372,
+      "bets": 78,
+      "max_drawdown_pct": 2.1689012480162004,
+      "profit_factor": 1.1661331655358047
+    },
+    {
+      "scenario": "hard",
+      "payout_haircut_pct": 0.03,
+      "commission_pct": 0.005,
+      "slippage_pct": 0.005,
+      "roi": 1.892393863493487,
+      "bets": 75,
+      "max_drawdown_pct": 2.1439932028400515,
+      "profit_factor": 1.1797534704034314
+    }
+  ],
+  "fixed_mode_monotonic_non_increasing_roi": true,
+  "backtest_run_id": "bt_20260209_080218_34cae7f7",
+  "backtest_generated_at_utc": "2026-02-09T08:02:18Z",
+  "active_model_run_id": "20260209_070638_xgb_sigmoid"
+}

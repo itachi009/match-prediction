@@ -1,0 +1,12 @@
+# Non caricare CSV
+*.csv
+
+# Output/cose inutili
+artifacts/
+runs/
+data/
+__pycache__/
+.ipynb_checkpoints/
+*.pkl
+*.joblib
+*.zip

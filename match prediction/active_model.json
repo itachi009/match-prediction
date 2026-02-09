@@ -1,0 +1,9 @@
+{
+  "run_id": "legacy_v9_balanced",
+  "model_family": "xgb",
+  "model_path": "model_v9_balanced.pkl",
+  "features_path": "model_features.pkl",
+  "metadata_path": "model_v9_training_report.json",
+  "created_at": "2026-02-07T00:00:00Z",
+  "notes": "Default active model registry entry for compatibility"
+}

@@ -1,0 +1,27 @@
+{
+  "frozen_at": "2026-02-06T11:50:48.253996+00:00",
+  "model_file": "model_v9_balanced.pkl",
+  "features_file": "processed_features.csv",
+  "odds_file": "2024_test.csv",
+  "config": {
+    "name": "v11_oriented_fair_kelly_oos_gate",
+    "min_edge": 0.05,
+    "min_ev": 0.04,
+    "min_confidence": 0.6,
+    "prob_shrink": 0.62,
+    "kelly_fraction": 0.015,
+    "max_stake_pct": 0.015,
+    "max_overround": 1.12,
+    "min_odds": 1.55,
+    "max_odds": 3.0,
+    "max_bet_share": 0.12,
+    "min_kelly_f": 0.07,
+    "min_signal_score": 0.004,
+    "edge_slope_by_odds": 0.02,
+    "payout_haircut_pct": 0.0,
+    "commission_pct": 0.0,
+    "slippage_pct": 0.0,
+    "residual_shrink_odds_2_5": 0.96,
+    "residual_shrink_odds_3_0": 0.95
+  }
+}
