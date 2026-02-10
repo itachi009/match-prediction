@@ -148,11 +148,23 @@ def _safe_path(value: object) -> Optional[Path]:
         return None
 
 
+def _is_child_of(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
 def collect_run_artifacts(
     source_dir: Path,
     validation_payload: Dict,
+    runs_dir: Path = RUNS_DIR,
     repo_root: Path = REPO_ROOT,
 ) -> List[Path]:
+    source_dir = source_dir.resolve()
+    runs_dir = runs_dir.resolve()
+    source_is_run_subdir = source_dir != runs_dir and source_dir.parent == runs_dir
     candidates: List[Path] = []
 
     required_names = [
@@ -170,8 +182,12 @@ def collect_run_artifacts(
     if isinstance(report_files, dict):
         for value in report_files.values():
             p = _safe_path(value)
-            if p and p.exists():
-                candidates.append(p)
+            if not p or not p.exists():
+                continue
+            # For historical materialization, trust only paths already under the run directory.
+            if source_is_run_subdir and not _is_child_of(p, source_dir):
+                continue
+            candidates.append(p)
 
     for name in OPTIONAL_ARTIFACT_NAMES:
         p = source_dir / name
@@ -193,7 +209,7 @@ def collect_run_artifacts(
     return unique
 
 
-def copy_artifacts_to_dir(files: Iterable[Path], target_dir: Path) -> List[Dict]:
+def copy_artifacts_to_dir(files: Iterable[Path], target_dir: Path, allow_overwrite: bool = False) -> List[Dict]:
     import shutil
 
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -203,6 +219,8 @@ def copy_artifacts_to_dir(files: Iterable[Path], target_dir: Path) -> List[Dict]
             continue
         dst = target_dir / src.name
         if src.resolve() != dst.resolve():
+            if dst.exists() and not allow_overwrite:
+                continue
             shutil.copy2(src, dst)
         copied.append(
             {
@@ -222,9 +240,21 @@ def materialize_run_dir(
     runs_dir: Path = RUNS_DIR,
     repo_root: Path = REPO_ROOT,
 ) -> Tuple[Path, List[Dict]]:
+    source_dir = source_dir.resolve()
+    runs_dir = runs_dir.resolve()
     run_dir = (runs_dir / run_id).resolve()
-    artifacts = collect_run_artifacts(source_dir=source_dir, validation_payload=validation_payload, repo_root=repo_root)
-    copied = copy_artifacts_to_dir(artifacts, run_dir)
+
+    payload_run_id = str(validation_payload.get("backtest_run_id", "")).strip()
+    if payload_run_id and payload_run_id != run_id:
+        raise ValueError(f"Run id mismatch: requested={run_id} payload={payload_run_id}")
+
+    artifacts = collect_run_artifacts(
+        source_dir=source_dir,
+        validation_payload=validation_payload,
+        runs_dir=runs_dir,
+        repo_root=repo_root,
+    )
+    copied = copy_artifacts_to_dir(artifacts, run_dir, allow_overwrite=(source_dir == runs_dir))
     return run_dir, copied
 
 

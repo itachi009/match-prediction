@@ -73,8 +73,12 @@ def _resolve_run_dir(run_id: str) -> Path:
     source_dir, validation_path = resolve_run_source(run_id=run_id, run_path=None, runs_dir=RUNS_DIR)
     payload = load_json(validation_path)
     resolved_run_id = extract_run_id(payload, source_dir)
+    if resolved_run_id != run_id:
+        raise ValueError(
+            f"Run id mismatch while resolving comparison input: requested={run_id}, resolved={resolved_run_id}"
+        )
     run_dir, _ = materialize_run_dir(
-        run_id=resolved_run_id,
+        run_id=run_id,
         source_dir=source_dir,
         validation_payload=payload,
         runs_dir=RUNS_DIR,

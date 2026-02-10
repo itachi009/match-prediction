@@ -41,6 +41,8 @@ Criteri guida:
 - Validation suite one-command (`python scripts/validate_all.py`) per orchestrare smoke test, backtest e confronto contro golden run.
 - Analisi diagnostica fold-level (`python scripts/analyze_walkforward_folds.py`) con report markdown e top segmenti perdita su Q3/Q4.
 - Confronto policy variants OFF vs ON soft (`python scripts/compare_policy_variants.py`) con diff metriche chiave e report JSON.
+- Materializzazione run resa immutabile: i path globali in `report_files` non sovrascrivono run storiche; aggiunto guardrail su mismatch `run_id` in fase di materializzazione.
+- Test anti-regressione dedicati in `tests/test_validation_common.py` per prevenire overwrite cross-run e validare i controlli su `run_id`.
 
 ## Architettura
 
@@ -322,6 +324,7 @@ BT_BASELINE_MIN_CONFIDENCE=0.71 \
 python backtest.py
 ```
 Esito atteso: `oos_status=GO`, `promotion_decision=promote`.
+Run GO di riferimento: `bt_20260210_192013_c1cb51e4` (allineata con `golden/latest`).
 
 ## Golden Run / Baseline
 
