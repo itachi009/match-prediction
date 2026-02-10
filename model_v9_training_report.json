@@ -1,0 +1,109 @@
+{
+  "model_file": "model_v9_balanced.pkl",
+  "features_file": "model_features.pkl",
+  "calibration_method": "sigmoid",
+  "train_rows_original": 300180,
+  "train_rows_augmented": 600360,
+  "test_rows": 65378,
+  "metrics_2024": {
+    "accuracy": 0.6864541588913702,
+    "auc": 0.7581307957248437,
+    "brier": 0.20008745799080283,
+    "logloss": 0.58379333063114
+  },
+  "v12_feature_count": 34,
+  "v12_feature_sample": [
+    "is_level_a",
+    "is_level_c",
+    "is_level_f",
+    "is_level_cf",
+    "p1_days_since_last_match",
+    "p2_days_since_last_match",
+    "p1_inactive_bucket",
+    "p2_inactive_bucket",
+    "p1_matches_last_30d",
+    "p2_matches_last_30d",
+    "p1_long_stop_90d",
+    "p2_long_stop_90d",
+    "p1_no_prev_match",
+    "p2_no_prev_match",
+    "days_since_last_diff",
+    "inactive_bucket_diff",
+    "matches_last_30d_diff",
+    "long_stop_90d_diff",
+    "no_prev_match_diff",
+    "days_since_last_diff_cf",
+    "long_stop_90d_diff_cf",
+    "p1_upset_win_rate_12",
+    "p2_upset_win_rate_12",
+    "p1_bad_loss_rate_12",
+    "p2_bad_loss_rate_12",
+    "p1_confidence_rank_score_12",
+    "p2_confidence_rank_score_12",
+    "p1_confidence_n_valid_12",
+    "p2_confidence_n_valid_12",
+    "upset_win_rate_12_diff"
+  ],
+  "top15_features": [
+    {
+      "feature": "log_rank_diff",
+      "importance": 0.1274518072605133
+    },
+    {
+      "feature": "surface_elo_diff",
+      "importance": 0.11440135538578033
+    },
+    {
+      "feature": "confidence_n_valid_12_diff",
+      "importance": 0.09222417324781418
+    },
+    {
+      "feature": "is_level_f",
+      "importance": 0.07718607783317566
+    },
+    {
+      "feature": "p1_confidence_n_valid_12",
+      "importance": 0.036713168025016785
+    },
+    {
+      "feature": "matches_last_30d_diff",
+      "importance": 0.03537382185459137
+    },
+    {
+      "feature": "p2_confidence_n_valid_12",
+      "importance": 0.03483356162905693
+    },
+    {
+      "feature": "is_level_a",
+      "importance": 0.029992420226335526
+    },
+    {
+      "feature": "is_level_c",
+      "importance": 0.025145214051008224
+    },
+    {
+      "feature": "no_prev_match_diff",
+      "importance": 0.024326452985405922
+    },
+    {
+      "feature": "is_level_cf",
+      "importance": 0.02227826416492462
+    },
+    {
+      "feature": "p2_no_prev_match",
+      "importance": 0.021373633295297623
+    },
+    {
+      "feature": "days_since_last_diff",
+      "importance": 0.02060013636946678
+    },
+    {
+      "feature": "p1_no_prev_match",
+      "importance": 0.017647596076130867
+    },
+    {
+      "feature": "confidence_rank_score_12_diff",
+      "importance": 0.014797991141676903
+    }
+  ]
+}

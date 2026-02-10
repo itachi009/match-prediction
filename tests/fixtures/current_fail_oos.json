@@ -1,0 +1,15 @@
+{
+  "oos_gate": {
+    "pass": false
+  },
+  "report_coherence": {
+    "pass": true
+  },
+  "baseline_result": {
+    "max_drawdown_pct": 1.0
+  },
+  "walk_forward": {
+    "n_valid_folds": 3,
+    "overall_baseline_roi": 0.15
+  }
+}

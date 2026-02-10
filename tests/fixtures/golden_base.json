@@ -1,0 +1,26 @@
+{
+  "oos_gate": {
+    "pass": true
+  },
+  "report_coherence": {
+    "pass": true
+  },
+  "baseline_result": {
+    "max_drawdown_pct": 2.0
+  },
+  "walk_forward": {
+    "n_valid_folds": 3,
+    "overall_baseline_roi": 0.45
+  },
+  "calibration": {
+    "brier_calibrated_shrunk": 0.210
+  },
+  "calibration_metrics": {
+    "ece_calibrated": 0.020
+  },
+  "no_odds_eval": {
+    "combined": {
+      "logloss": 0.580
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "families": {
+    "xgb": {
+      "enabled": true,
+      "trials": 30
+    },
+    "lgbm": {
+      "enabled": true,
+      "trials": 30
+    },
+    "catboost": {
+      "enabled": true,
+      "trials": 20
+    },
+    "logreg": {
+      "enabled": true,
+      "trials": 1
+    }
+  },
+  "selection": {
+    "top_k_per_family": 2,
+    "score_formula": "-logloss + 0.30*auc - 0.20*ece - 0.10*mce"
+  },
+  "training": {
+    "calibration_default": "sigmoid",
+    "time_series_splits": 4,
+    "seed": 42
+  }
+}

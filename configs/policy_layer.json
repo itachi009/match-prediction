@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "max_uncertainty_for_bet": 0.55,
+  "skip_odds_bucket_17_21": true,
+  "max_uncertainty_for_17_21": 0.20,
+  "min_confidence_for_17_21": 0.70,
+  "max_uncertainty_for_p_70_75": 0.25,
+  "policy_soft_mode": false,
+  "p_bucket_penalty": 0.15
+}

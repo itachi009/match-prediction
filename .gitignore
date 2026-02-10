@@ -1,0 +1,50 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Local env files
+.env
+.env.*
+!.env.example
+
+# Generated runtime artifacts
+artifacts/
+runs/
+data/
+golden/
+*.log
+
+# Runtime state and generated reports at repo root
+active_model.json
+backtest_baseline_config.json
+backtest_stress_report.json
+backtest_validation_report.json
+backtest_walkforward_report.json
+backtest_results.png
+real_backtest.png
+reliability_by_odds_bucket.csv
+reliability_by_p_bucket.csv
+reliability_by_uncertainty_bucket.csv
+reliability_curve.png
+reliability_table.csv
+player_mapping.json
+
+# Local models and datasets
+*.pkl
+*.joblib
+2024.xlsx

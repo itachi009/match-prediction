@@ -1,0 +1,13 @@
+{
+  "min_bets_for_tuning": 100,
+  "objective_mode": "roi_minus_lambda_bets_ratio",
+  "lambda_bets": 0.5,
+  "max_bets_increase_pct": 0.2,
+  "fallback_eps_roi_pct": 0.1,
+  "restricted_tuning_mode": false,
+  "restricted_fixed_min_ev": 0.06,
+  "restricted_fixed_prob_shrink": 0.6,
+  "restricted_min_edge_values": [0.06, 0.065],
+  "restricted_min_confidence_values": [0.64, 0.66],
+  "fold_freq": "quarter"
+}
