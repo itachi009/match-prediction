@@ -48,3 +48,13 @@ Esito finale: `oos_status=GO`, `oos_pass=True`, `promotion_status=promote`.
 Snapshot golden aggiornato con `python scripts/snapshot_golden_run.py --run-id bt_20260210_192013_c1cb51e4`; `golden/latest/manifest.json` allineato al run id finale.
 Regression gate finale: `status=PASS`, `pass=True`, `hard_failures={}`, `warnings={}`.
 Eseguiti post-check: `python scripts/analyze_walkforward_folds.py --run-id bt_20260210_192013_c1cb51e4` e `python scripts/validate_all.py --no-backtest --skip-smokes --run-id bt_20260210_192013_c1cb51e4 --golden golden/latest`.
+
+2026-02-10 - Sessione fix materializzazione run + setup Git.
+Inizializzata repository Git locale (`main`), aggiunto `.gitignore`, commit iniziale e push su `origin/main`.
+Fix anti-corruzione run storiche in `scripts/_validation_common.py`: i `report_files` globali non vengono applicati quando si materializza una run gia storica; overwrite consentito solo da sorgente `runs/` root.
+Aggiunto guardrail su coerenza ID (`requested run_id` vs `backtest_run_id` nel payload) con `ValueError` su mismatch.
+Aggiornato `scripts/compare_policy_variants.py` con check esplicito su mismatch `run_id` in risoluzione input.
+Aggiunti test dedicati `tests/test_validation_common.py` (no-overwrite cross-run + mismatch run_id).
+Allineate dipendenze runtime in `requirements-ml.txt`: aggiunti `Unidecode` e `thefuzz[speedup]`.
+Test eseguiti: `python -m pytest tests/test_regression_gate.py tests/test_validation_common.py -q` -> `6 passed`.
+Branch fix pubblicato: `fix/run-materialization-immutability`; commit `4156058`.
