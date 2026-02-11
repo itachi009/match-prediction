@@ -58,3 +58,22 @@ Aggiunti test dedicati `tests/test_validation_common.py` (no-overwrite cross-run
 Allineate dipendenze runtime in `requirements-ml.txt`: aggiunti `Unidecode` e `thefuzz[speedup]`.
 Test eseguiti: `python -m pytest tests/test_regression_gate.py tests/test_validation_common.py -q` -> `6 passed`.
 Branch fix pubblicato: `fix/run-materialization-immutability`; commit `4156058`.
+
+2026-02-11 - Iterazione model-selection (logreg benchmark) con rollback controllato.
+Obiettivo: verificare se il candidato `20260210_150520_logreg_sigmoid_benchmark_default` migliora robustezza OOS rispetto alla baseline GO xgb.
+Switch temporaneo `active_model.json` a logreg, esecuzione backtest con config GO (`MP_POLICY_ENABLED=false`, `MP_ENABLE_BUCKET_REPORTS=true`, `BT_RESTRICTED_TUNING_MODE=true`, `BT_FOLD_FREQ=quarter`, `BT_BASELINE_MIN_ODDS=1.7`, `BT_BASELINE_MIN_CONFIDENCE=0.71`).
+Run esperimento: `bt_20260211_082036_18378835`.
+Esito: `oos_status=GO_WITH_CAUTION`, `oos_pass=False`, `promotion_status=keep_baseline`, `baseline_roi=0.0`, `walkforward_overall_baseline_roi=0.0`, `bets=0`.
+Confronto con run riferimento xgb `bt_20260210_192013_c1cb51e4`: quest'ultima resta migliore (`oos_status=GO`, `oos_pass=True`, `promotion_status=promote`, `baseline_roi=0.3322`, `walkforward_overall_baseline_roi=0.3028`, `bets=1`).
+Azione finale: rollback dell'active model a `20260210_190225_xgb_sigmoid` (stato stabile preservato).
+
+2026-02-11 - Diagnostica walk-forward (fold mancanti / pochi bet) con fix analisi e tool coverage.
+Triage run target `bt_20260210_192013_c1cb51e4`: `backtest_walkforward_report.json` contiene 4 fold (`2024Q1..Q4`), `n_valid_folds=3`, ma `backtest_walkforward_bet_records.csv` contiene bet solo su `2024Q2`.
+Conclusione A/B/C: A=False (export non rotto), C=True (analisi filtrava sui soli bet finali), B=True (filtri stretti: drop-off forte prima del bet finale).
+Fix in `scripts/analyze_walkforward_folds.py`: fold universe letto da `backtest_walkforward_report.json` (`rows`), zero-fill fold senza bet, warning chiari su campione basso, auto-detect colonna periodo, sezione `Data Coverage` + `Coverage Drop-Off`.
+Aggiunto modulo condiviso `scripts/walkforward_coverage.py` (detect colonne, summary fold, coverage tables, suggerimento soglie).
+Aggiunti script operativi: `scripts/debug_walkforward_coverage.py` (one-shot debug + markdown) e `scripts/suggest_thresholds.py` (candidate `min_confidence/min_odds` da quantili).
+Nuove fixture/test: `tests/fixtures/wf_*` + `tests/test_walkforward_diagnostics.py`.
+Verifica run target dopo fix analisi: `analysis_walkforward.md` ora mostra `2024Q2/Q3/Q4` nel fold summary; warning su bet bassi (`1 < 30`) e drop-off per fold.
+Debug one-shot run target: `pred=2052`, `pass_conf=193`, `pass_conf_and_odds=1`, `final_bets=1` (evidenza filtri molto selettivi, non bug export).
+Test eseguiti: `python -m pytest tests/test_regression_gate.py tests/test_validation_common.py tests/test_walkforward_diagnostics.py -q` -> `8 passed`.

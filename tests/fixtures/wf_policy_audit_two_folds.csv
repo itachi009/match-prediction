@@ -1,0 +1,5 @@
+odds_row_id,p_calibrated,confidence_before_policy,effective_confidence,uncertainty_score,odds,level,policy_allowed,policy_reason,test_period,policy_variant,use_tuned_policy
+100,0.75,0.74,0.74,0.1,1.8,A,True,allow,2024Q2,baseline,False
+101,0.70,0.69,0.69,0.1,1.9,A,True,allow,2024Q2,baseline,False
+200,0.72,0.68,0.68,0.1,1.6,A,True,allow,2024Q3,baseline,False
+201,0.73,0.73,0.73,0.1,1.65,A,True,allow,2024Q3,baseline,False

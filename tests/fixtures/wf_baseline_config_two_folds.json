@@ -1,0 +1,7 @@
+{
+  "config": {
+    "min_confidence": 0.71,
+    "min_odds": 1.7,
+    "max_odds": 3.0
+  }
+}

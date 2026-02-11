@@ -1,0 +1,3 @@
+odds_row_id,tourney_date,stake,pnl,odd_sel_raw,effective_confidence,uncertainty_score,policy_allowed,policy_reason,test_period,policy_variant,use_tuned_policy
+100,2024-04-01,2.0,1.6,1.8,0.74,0.1,True,allow,2024Q2,baseline,False
+100,2024-04-01,2.0,1.6,1.8,0.74,0.1,True,allow,2024Q2,tuned,False

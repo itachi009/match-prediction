@@ -1,0 +1,22 @@
+{
+  "fold_freq": "quarter",
+  "n_valid_folds": 2,
+  "overall_baseline_roi": 0.0,
+  "overall_tuned_roi": 0.0,
+  "rows": [
+    {
+      "test_period": "2024Q2",
+      "fold_valid": true,
+      "skip_reason": "",
+      "baseline_test_bets": 1,
+      "tuned_test_bets": 1
+    },
+    {
+      "test_period": "2024Q3",
+      "fold_valid": true,
+      "skip_reason": "",
+      "baseline_test_bets": 0,
+      "tuned_test_bets": 0
+    }
+  ]
+}

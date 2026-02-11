@@ -5,6 +5,19 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from _validation_common import RUNS_DIR, extract_run_id, load_json, materialize_run_dir, resolve_run_source, utc_now_iso
+from walkforward_coverage import (
+    DATE_COLUMN_CANDIDATES,
+    build_coverage_tables,
+    build_fold_summary,
+    detect_column,
+    ensure_period_column,
+    fold_universe_from_wf_rows,
+    load_thresholds_from_baseline_config,
+)
+
+
+MIN_FOLDS_WARNING = 2
+MIN_BETS_WARNING = 30
 
 
 def _md_table(df: pd.DataFrame) -> str:
@@ -110,9 +123,14 @@ def main() -> int:
     run_dir, _ = materialize_run_dir(run_id=run_id, source_dir=source_dir, validation_payload=validation, runs_dir=RUNS_DIR)
 
     wf_report_path = run_dir / "backtest_walkforward_report.json"
-    wf_report = load_json(wf_report_path) if wf_report_path.exists() else {}
+    baseline_cfg_path = run_dir / "backtest_baseline_config.json"
     bet_path = run_dir / "backtest_walkforward_bet_records.csv"
     policy_path = run_dir / "backtest_walkforward_policy_audit.csv"
+    wf_report = load_json(wf_report_path) if wf_report_path.exists() else {}
+    wf_rows_df = pd.DataFrame(wf_report.get("rows", []))
+    if not wf_rows_df.empty:
+        wf_rows_df, _ = ensure_period_column(wf_rows_df, out_col="test_period")
+    fold_universe = fold_universe_from_wf_rows(wf_rows_df)
 
     md_lines: List[str] = []
     md_lines.append("# Walk-Forward Fold Analysis")
@@ -122,44 +140,31 @@ def main() -> int:
     md_lines.append(f"- run_dir: `{run_dir}`")
     md_lines.append("")
 
-    missing: List[str] = []
-    if not bet_path.exists():
-        missing.append(str(bet_path.name))
-    if not wf_report_path.exists():
-        missing.append(str(wf_report_path.name))
-
-    if missing:
+    missing: List[str] = [p.name for p in [wf_report_path, bet_path, policy_path] if not p.exists()]
+    if not wf_report_path.exists() and not bet_path.exists() and not policy_path.exists():
         md_lines.append("## Missing Inputs")
         md_lines.append("")
         for item in missing:
             md_lines.append(f"- `{item}`")
         md_lines.append("")
-        if wf_report.get("rows"):
-            md_lines.append("## Walk-Forward Rows (fallback)")
-            rows_df = pd.DataFrame(wf_report.get("rows", []))
-            keep_cols = [c for c in ["test_period", "fold_valid", "skip_reason", "baseline_test_roi", "baseline_test_bets"] if c in rows_df.columns]
-            md_lines.append(_md_table(rows_df[keep_cols] if keep_cols else rows_df))
         out_path = run_dir / "analysis_walkforward.md"
         out_path.write_text("\n".join(md_lines).strip() + "\n", encoding="utf-8")
         print(f"[analyze-folds] report: {out_path}")
         print("[analyze-folds] done (graceful degradation)")
         return 0
 
-    bet_df = pd.read_csv(bet_path)
-    if bet_df.empty:
-        md_lines.append("## Bet Records")
-        md_lines.append("")
-        md_lines.append("_CSV presente ma senza righe._")
-        out_path = run_dir / "analysis_walkforward.md"
-        out_path.write_text("\n".join(md_lines).strip() + "\n", encoding="utf-8")
-        print(f"[analyze-folds] report: {out_path}")
-        return 0
+    bet_df = pd.read_csv(bet_path) if bet_path.exists() else pd.DataFrame()
+    if not bet_df.empty:
+        bet_df, _ = ensure_period_column(bet_df, out_col="test_period")
+    policy_df = pd.read_csv(policy_path) if policy_path.exists() else pd.DataFrame()
+    if not policy_df.empty:
+        policy_df, _ = ensure_period_column(policy_df, out_col="test_period")
+    baseline_cfg = load_json(baseline_cfg_path) if baseline_cfg_path.exists() else {}
+    thresholds = load_thresholds_from_baseline_config(baseline_cfg)
 
     for col in ["stake", "pnl", "odd_sel_raw", "effective_confidence", "uncertainty_score"]:
         if col in bet_df.columns:
             bet_df[col] = pd.to_numeric(bet_df[col], errors="coerce")
-    if "test_period" not in bet_df.columns:
-        bet_df["test_period"] = "UNKNOWN"
 
     if "policy_variant" in bet_df.columns:
         baseline_df = bet_df[bet_df["policy_variant"].astype(str) == "baseline"].copy()
@@ -168,21 +173,40 @@ def main() -> int:
     if baseline_df.empty:
         baseline_df = bet_df.copy()
 
-    fold_summary = (
-        baseline_df.groupby("test_period", dropna=False)
-        .agg(
-            n_bets=("odds_row_id", "size"),
-            stake_sum=("stake", "sum"),
-            pnl_sum=("pnl", "sum"),
-            avg_odds=("odd_sel_raw", "mean"),
+    fold_summary = build_fold_summary(baseline_df, fold_universe=fold_universe)
+    fold_count = int(len(fold_universe)) if fold_universe else int(fold_summary["test_period"].nunique() if not fold_summary.empty else 0)
+    total_bets = int(fold_summary["n_bets"].sum()) if not fold_summary.empty else 0
+
+    warnings: List[str] = []
+    if fold_count < MIN_FOLDS_WARNING:
+        warnings.append(
+            f"Folds trovati insufficienti: {fold_count} (<{MIN_FOLDS_WARNING}). Verifica input walk-forward e period column."
         )
-        .reset_index()
+    if total_bets < MIN_BETS_WARNING:
+        warnings.append(
+            f"Bet totali bassi: {total_bets} (<{MIN_BETS_WARNING}). Q3/Q4 potrebbero non essere statisticamente diagnostici."
+        )
+
+    per_fold_coverage, coverage_totals = build_coverage_tables(
+        policy_df=policy_df,
+        baseline_bets_df=baseline_df,
+        min_confidence=thresholds.get("min_confidence"),
+        min_odds=thresholds.get("min_odds"),
+        max_odds=thresholds.get("max_odds"),
+        fold_universe=fold_universe,
     )
-    fold_summary["roi_pct"] = fold_summary.apply(
-        lambda r: (float(r["pnl_sum"]) / float(r["stake_sum"]) * 100.0) if float(r["stake_sum"]) > 0 else 0.0,
-        axis=1,
-    )
-    fold_summary = fold_summary.sort_values("test_period").reset_index(drop=True)
+
+    bet_folds = sorted(baseline_df["test_period"].astype(str).unique().tolist()) if not baseline_df.empty else []
+    policy_folds = sorted(policy_df["test_period"].astype(str).unique().tolist()) if not policy_df.empty else []
+    wf_folds = list(fold_universe)
+    date_col = detect_column(baseline_df, DATE_COLUMN_CANDIDATES)
+    date_min = ""
+    date_max = ""
+    if date_col and date_col in baseline_df.columns and not baseline_df.empty:
+        dates = pd.to_datetime(baseline_df[date_col], errors="coerce").dropna()
+        if not dates.empty:
+            date_min = str(dates.min().date())
+            date_max = str(dates.max().date())
 
     odds_bucket = _bucket_report(
         baseline_df,
@@ -204,6 +228,40 @@ def main() -> int:
         label="uncertainty_bucket",
     )
     top_losses = _top_loss_segments(odds_bucket, confidence_bucket, uncertainty_bucket, fold_summary)
+
+    if warnings:
+        md_lines.append("## Warnings")
+        md_lines.append("")
+        for item in warnings:
+            md_lines.append(f"- {item}")
+            print(f"[WARN] {item}")
+        md_lines.append("")
+
+    md_lines.append("## Data Coverage")
+    md_lines.append("")
+    md_lines.append(f"- fold_freq: `{wf_report.get('fold_freq', 'n/a')}`")
+    md_lines.append(f"- n_valid_folds: `{wf_report.get('n_valid_folds', 'n/a')}`")
+    md_lines.append(f"- folds_from_wf_rows: `{', '.join(wf_folds) if wf_folds else 'n/a'}`")
+    md_lines.append(f"- folds_from_bet_records: `{', '.join(bet_folds) if bet_folds else 'n/a'}`")
+    md_lines.append(f"- folds_from_policy_audit: `{', '.join(policy_folds) if policy_folds else 'n/a'}`")
+    md_lines.append(f"- date_coverage_min: `{date_min or 'n/a'}`")
+    md_lines.append(f"- date_coverage_max: `{date_max or 'n/a'}`")
+    md_lines.append(
+        f"- thresholds_used: `min_confidence={thresholds.get('min_confidence')}`, "
+        f"`min_odds={thresholds.get('min_odds')}`, `max_odds={thresholds.get('max_odds')}`"
+    )
+    md_lines.append("")
+    md_lines.append("### Coverage Drop-Off (baseline)")
+    md_lines.append("")
+    md_lines.append(
+        f"- totals: predictions={coverage_totals.get('n_predictions', 0)}, "
+        f"pass_conf={coverage_totals.get('n_pass_conf', 0)}, "
+        f"pass_conf_and_odds={coverage_totals.get('n_pass_odds', 0)}, "
+        f"final_bets={coverage_totals.get('n_final_bets', 0)}"
+    )
+    md_lines.append("")
+    md_lines.append(_md_table(per_fold_coverage))
+    md_lines.append("")
 
     md_lines.append("## Fold Summary")
     md_lines.append("")
@@ -230,8 +288,7 @@ def main() -> int:
     md_lines.append(_md_table(top_losses))
     md_lines.append("")
 
-    if policy_path.exists():
-        policy_df = pd.read_csv(policy_path)
+    if not policy_df.empty:
         if not policy_df.empty and {"test_period", "policy_reason", "policy_allowed"}.issubset(policy_df.columns):
             blocked = policy_df[policy_df["policy_allowed"].astype(str).str.lower().isin(["false", "0", "no"])].copy()
             blocked_summary = (

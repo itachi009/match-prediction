@@ -401,6 +401,40 @@ Output:
 - tabelle su fold ROI/bets/avg odds + bucket (`odds`, `effective_confidence`, `uncertainty_score`)
 - top 3 segmenti perdita (Q3/Q4 o fold peggiori)
 
+## Diagnostica Walk-Forward (Pochi Bet / Fold Mancanti)
+
+Quando `analysis_walkforward.md` mostra solo pochi fold o pochi bet:
+
+1. Controllare i file sorgente della run:
+   - `runs/<run_id>/backtest_walkforward_report.json` (universo fold, `n_valid_folds`, rows)
+   - `runs/<run_id>/backtest_walkforward_bet_records.csv` (solo bet finali)
+   - `runs/<run_id>/backtest_walkforward_policy_audit.csv` (copertura candidati pre-bet)
+
+2. Rigenerare una run (se i file mancano):
+```bash
+python backtest.py
+```
+
+3. Analisi fold-level con warning coverage:
+```bash
+python scripts/analyze_walkforward_folds.py --run-id bt_YYYYMMDD_HHMMSS_xxxxxxxx
+```
+
+4. Debug one-shot drop-off (`pred -> pass_conf -> pass_odds -> bet`):
+```bash
+python scripts/debug_walkforward_coverage.py --run-id bt_YYYYMMDD_HHMMSS_xxxxxxxx
+```
+Output:
+- `runs/<run_id>/debug_walkforward_coverage.md`
+- conteggi per fold (`n_predictions`, `n_pass_conf`, `n_pass_odds`, `n_final_bets`)
+
+5. Suggerimento soglie candidate (senza cambiare default):
+```bash
+python scripts/suggest_thresholds.py --run-id bt_YYYYMMDD_HHMMSS_xxxxxxxx --target-bets-per-fold 50
+```
+
+Regola pratica: se i bet totali walk-forward sono `< ~30`, non trarre conclusioni forti su Q3/Q4.
+
 ## Policy Layer (Post-Processing Betting)
 
 Layer leggero applicato **prima** della decisione finale di bet/recommend.
